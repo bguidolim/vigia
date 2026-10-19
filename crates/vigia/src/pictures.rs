@@ -449,6 +449,8 @@ pub struct Pictures {
     tmux: bool,
     /// Where the picker goes, until it has been given.
     picker: Option<mpsc::Sender<Picker>>,
+    /// How many images this cache's worker has decoded.
+    decoded: Arc<AtomicU64>,
 }
 
 /// A Kitty image id no other picture, nor another pane on the same terminal,
@@ -470,20 +472,16 @@ fn kitty_id() -> u32 {
     }
 }
 
-/// Pictures decoded since the process started, on any thread.
-static DECODES: AtomicU64 = AtomicU64::new(0);
-/// Of those, the ones decoded anywhere but the worker, which is a paint paying
-/// for one.
+std::thread_local! {
+    /// Decodes on this thread since its worker last handed them to its cache.
+    static DECODED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Pictures decoded anywhere but a worker, which is a paint paying for one.
 static OFF_WORKER: AtomicU64 = AtomicU64::new(0);
 /// The worker thread's name, which is how a decode knows where it runs.
 const WORKER: &str = "vigia-pictures";
 
 pub use vigia_core::{Stage, panic_next};
-
-/// How many images have been decoded so far.
-pub fn decodes() -> u64 {
-    DECODES.load(Ordering::Relaxed)
-}
 
 /// How many images have been decoded on a thread that is not the worker.
 pub fn decodes_off_worker() -> u64 {
@@ -517,6 +515,8 @@ impl Pictures {
         let (picked, picker) = mpsc::channel::<Picker>();
         let shown = Arc::new(Mutex::new(HashSet::new()));
         let still = Arc::clone(&shown);
+        let decoded = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&decoded);
         // Detached: it ends when the cache, and with it the sender, is dropped.
         let _ = std::thread::Builder::new()
             .name(WORKER.to_owned())
@@ -536,6 +536,9 @@ impl Pictures {
                     let built = wanted.then(|| {
                         vigia_core::caught(|| build(&job, inks, &picker)).unwrap_or_else(undecoded)
                     });
+                    // Before the send, so a caller that has the picture sees
+                    // what it cost.
+                    counted.fetch_add(DECODED.take(), Ordering::Relaxed);
                     vigia_core::armed(Stage::Worker);
                     if outbox.send((job.key, built)).is_err() {
                         break;
@@ -552,7 +555,14 @@ impl Pictures {
             retired: Vec::new(),
             tmux: false,
             picker: Some(picked),
+            decoded,
         }
+    }
+
+    /// How many images this cache's worker has decoded, every picture it has
+    /// handed back counted.
+    pub fn decodes(&self) -> u64 {
+        self.decoded.load(Ordering::Relaxed)
     }
 
     /// Say how pictures are encoded, which starts the held jobs. Once only.
@@ -700,8 +710,8 @@ const MAX_SIDE: u32 = 16_384;
 /// The most one decode may allocate.
 const MAX_ALLOC: u64 = 512 * 1024 * 1024;
 
-fn image_format(format: Format) -> ImageFormat {
-    match format {
+fn image_format(format: Format) -> Option<ImageFormat> {
+    Some(match format {
         Format::Png => ImageFormat::Png,
         Format::Jpeg => ImageFormat::Jpeg,
         Format::Gif => ImageFormat::Gif,
@@ -711,20 +721,413 @@ fn image_format(format: Format) -> ImageFormat {
         Format::Tiff => ImageFormat::Tiff,
         Format::Qoi => ImageFormat::Qoi,
         Format::Tga => ImageFormat::Tga,
+        Format::Svg => return None,
+    })
+}
+
+/// The long side an SVG is rendered at, which every panel is shrunk from,
+/// unless its filters cost more than [`FILTER_BUDGET`] there.
+const SVG_LONG_SIDE: f32 = 1024.0;
+/// The shortest long side an SVG is rendered at before it is refused.
+const SVG_SHORTEST: f32 = 64.0;
+/// What one SVG's filters may cost, in kernel cells times pixels. Sixty-four
+/// blurs at 256 pixels a side, about 250ms.
+const FILTER_BUDGET: f64 = 1024.0 * 256.0 * 256.0;
+/// What a filter primitive costs whose work per pixel is fixed, in kernel
+/// cells. A blur measured at about twenty.
+const PRIMITIVE_CELLS: u64 = 16;
+/// What one octave of turbulence costs, in kernel cells, as measured.
+const OCTAVE_CELLS: u64 = 16;
+
+/// SVG references to other files refused, since the process started.
+static REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// How many references to other files SVGs have asked for and been refused.
+pub fn hrefs_refused() -> u64 {
+    REFUSED.load(Ordering::Relaxed)
+}
+
+/// The system's fonts, loaded once on the worker for the first SVG with text.
+fn fonts() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
+    static FONTS: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
+        std::sync::OnceLock::new();
+    FONTS
+        .get_or_init(|| {
+            let mut fonts = resvg::usvg::fontdb::Database::new();
+            fonts.load_system_fonts();
+            fallback_families(&mut fonts);
+            std::sync::Arc::new(fonts)
+        })
+        .clone()
+}
+
+/// Stand-ins for the faces usvg's generic families name, metric-compatible
+/// first: Times New Roman, Arial and Courier New.
+const SERIF: &[&str] = &[
+    "Liberation Serif",
+    "Tinos",
+    "Nimbus Roman",
+    "DejaVu Serif",
+    "Noto Serif",
+];
+const SANS: &[&str] = &[
+    "Liberation Sans",
+    "Arimo",
+    "Nimbus Sans",
+    "DejaVu Sans",
+    "Noto Sans",
+];
+const MONO: &[&str] = &[
+    "Liberation Mono",
+    "Cousine",
+    "Nimbus Mono PS",
+    "DejaVu Sans Mono",
+    "Noto Sans Mono",
+];
+
+/// Point `serif`, `sans-serif` and `monospace`, where one names no installed
+/// face or one that draws no Latin text, at one that does. usvg falls back to
+/// `serif`, Times New Roman, so without one a label draws nothing. A cursive
+/// or fantasy label falls through to `serif`.
+fn fallback_families(fonts: &mut resvg::usvg::fontdb::Database) {
+    use resvg::usvg::fontdb::{Family, Query};
+    let wanted: [Generic; 3] = [
+        (Family::Serif, SERIF, serif_hint, |fonts, name| {
+            fonts.set_serif_family(name)
+        }),
+        (Family::SansSerif, SANS, sans_hint, |fonts, name| {
+            fonts.set_sans_serif_family(name)
+        }),
+        (Family::Monospace, MONO, mono_hint, |fonts, name| {
+            fonts.set_monospace_family(name)
+        }),
+    ];
+    let faces = faces_of(fonts);
+    // Read once per face: a face is mapped to read it.
+    let read = std::cell::RefCell::new(HashMap::new());
+    let latin = |id| {
+        *read
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| fonts.with_face_data(id, covers_latin).unwrap_or(false))
+    };
+    let chosen: Vec<_> = wanted
+        .into_iter()
+        .filter(|(family, ..)| {
+            let resolved = fonts.query(&Query {
+                families: &[*family],
+                ..Query::default()
+            });
+            !resolved.is_some_and(latin)
+        })
+        .filter_map(|(_, known, hinted, set)| {
+            Some((set, fallback(&faces, known, hinted, |face| latin(face.id))?))
+        })
+        .collect();
+    for (set, name) in chosen {
+        set(fonts, name);
     }
 }
 
-/// One side decoded, with its colour profile. The first frame only.
-fn decode(source: &Source, format: Format) -> Option<(RgbaImage, Option<Vec<u8>>)> {
-    use image::ImageDecoder;
+/// A generic family, its known stand-ins, the faces its name hints at, and
+/// how to point it.
+type Generic = (
+    resvg::usvg::fontdb::Family<'static>,
+    &'static [&'static str],
+    fn(&FaceInfo) -> bool,
+    fn(&mut resvg::usvg::fontdb::Database, String),
+);
+
+fn serif_hint(face: &FaceInfo) -> bool {
+    let mut words = face.name.split_whitespace();
+    words.clone().any(|word| word == "Serif") && !words.any(|word| word == "Sans")
+}
+
+fn sans_hint(face: &FaceInfo) -> bool {
+    face.name.split_whitespace().any(|word| word == "Sans") && !face.monospaced
+}
+
+fn mono_hint(face: &FaceInfo) -> bool {
+    face.monospaced
+}
+
+/// What choosing a fallback reads of one installed face.
+struct FaceInfo {
+    id: resvg::usvg::fontdb::ID,
+    name: String,
+    monospaced: bool,
+}
+
+/// Every installed face, sorted by name.
+fn faces_of(fonts: &resvg::usvg::fontdb::Database) -> Vec<FaceInfo> {
+    let mut faces: Vec<FaceInfo> = fonts
+        .faces()
+        .filter_map(|face| {
+            Some(FaceInfo {
+                id: face.id,
+                name: face.families.first()?.0.clone(),
+                monospaced: face.monospaced,
+            })
+        })
+        .collect();
+    faces.sort_by(|a, b| a.name.cmp(&b.name));
+    faces
+}
+
+/// The face to fall back to: the first of `known` installed, else one that
+/// `hinted` picks, else any. Only a face `latin` passes is taken, and it is
+/// read only when reached.
+fn fallback(
+    faces: &[FaceInfo],
+    known: &[&str],
+    hinted: impl Fn(&FaceInfo) -> bool,
+    latin: impl Fn(&FaceInfo) -> bool,
+) -> Option<String> {
+    let by_name = known
+        .iter()
+        .flat_map(|name| faces.iter().filter(move |face| face.name == *name));
+    by_name
+        .chain(faces.iter().filter(|face| hinted(face)))
+        .chain(faces.iter())
+        .find(|face| latin(face))
+        .map(|face| face.name.clone())
+}
+
+/// Whether the face at `index` in `data` maps every ASCII letter and digit
+/// to a glyph of its own.
+fn covers_latin(data: &[u8], index: u32) -> bool {
+    use skrifa::MetadataProvider;
+    let Ok(font) = skrifa::FontRef::from_index(data, index) else {
+        return false;
+    };
+    let charmap = font.charmap();
+    // A symbol map puts its pictures where the ASCII letters would be.
+    if charmap.is_symbol() {
+        return false;
+    }
+    ('a'..='z')
+        .chain('A'..='Z')
+        .chain('0'..='9')
+        .all(|ch| charmap.map(ch).is_some())
+}
+
+/// The most encoded bytes one SVG's embedded images may hold, every `<use>`
+/// copy counted, before the document is refused.
+const EMBEDDED_BUDGET: u64 = 32 * 1024 * 1024;
+
+/// An embedded image, as usvg reads it, once its share of `budget` and its
+/// size are known to fit. One with no raster size is left out, as usvg leaves
+/// out one it cannot read: a nested SVG is, with its own million nodes. Over
+/// the budget or the size limits sets `over`.
+fn embedded(
+    mime: &str,
+    data: std::sync::Arc<Vec<u8>>,
+    options: &resvg::usvg::Options,
+    budget: &AtomicU64,
+    over: &std::sync::atomic::AtomicBool,
+) -> Option<resvg::usvg::ImageKind> {
+    let refuse = || {
+        over.store(true, Ordering::Relaxed);
+        None
+    };
+    let size = data.len() as u64;
+    if budget
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            left.checked_sub(size)
+        })
+        .is_err()
+    {
+        return refuse();
+    }
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(&**data))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if width > MAX_SIDE || height > MAX_SIDE || u64::from(width) * u64::from(height) * 4 > MAX_ALLOC
+    {
+        return refuse();
+    }
+    (resvg::usvg::ImageHrefResolver::default_data_resolver())(mime, data, options)
+}
+
+/// What one filter primitive costs per pixel.
+enum Price {
+    Cells(u64),
+    /// A window this many root user units across each way, as a morphology
+    /// scans, so its cost grows with the render scale.
+    Window(f32, f32),
+}
+
+/// Every filter primitive `tree` runs, every `<use>` copy counted.
+fn prices(tree: &resvg::usvg::Tree) -> Vec<Price> {
+    use resvg::usvg::{Group, Node, filter::Kind};
+    fn weigh(group: &Group, prices: &mut Vec<Price>) {
+        let (sx, sy) = group.abs_transform().get_scale();
+        for primitive in group
+            .filters()
+            .iter()
+            .flat_map(|filter| filter.primitives())
+        {
+            prices.push(match primitive.kind() {
+                Kind::ConvolveMatrix(convolve) => {
+                    let matrix = convolve.matrix();
+                    Price::Cells(u64::from(matrix.columns()) * u64::from(matrix.rows()))
+                }
+                Kind::Morphology(morphology) => Price::Window(
+                    2.0 * morphology.radius_x().get() * sx,
+                    2.0 * morphology.radius_y().get() * sy,
+                ),
+                Kind::Turbulence(turbulence) => {
+                    Price::Cells(u64::from(turbulence.num_octaves()).saturating_mul(OCTAVE_CELLS))
+                }
+                _ => Price::Cells(PRIMITIVE_CELLS),
+            });
+        }
+        for node in group.children() {
+            if let Node::Group(child) = node {
+                weigh(child, prices);
+            }
+            node.subroots(|root| weigh(root, prices));
+        }
+    }
+    let mut prices = Vec::new();
+    weigh(tree.root(), &mut prices);
+    prices
+}
+
+/// What `prices` cost over a render `long` pixels on its long side, for a
+/// document whose own long side is `size`.
+fn filter_cost(prices: &[Price], size: f32, long: f32) -> f64 {
+    let scale = long / size;
+    let across = |units: f32| (units * scale).ceil().clamp(1.0, long) as f64;
+    let cells: f64 = prices
+        .iter()
+        .map(|price| match *price {
+            Price::Cells(cells) => cells as f64,
+            Price::Window(x, y) => across(x) * across(y),
+        })
+        .sum();
+    cells * f64::from(long) * f64::from(long)
+}
+
+/// The longest side, up to [`SVG_LONG_SIDE`], at which every side's filters
+/// cost no more than [`FILTER_BUDGET`], or `None` when even
+/// [`SVG_SHORTEST`] costs more.
+fn long_side(sides: &[(Vec<Price>, f32)]) -> Option<f32> {
+    let fits = |long: f32| {
+        sides
+            .iter()
+            .all(|(prices, size)| filter_cost(prices, *size, long) <= FILTER_BUDGET)
+    };
+    if fits(SVG_LONG_SIDE) {
+        return Some(SVG_LONG_SIDE);
+    }
+    if !fits(SVG_SHORTEST) {
+        return None;
+    }
+    // The cost only grows with the side, so the longest that fits is found by
+    // halving.
+    let (mut fit, mut over) = (SVG_SHORTEST as u32, SVG_LONG_SIDE as u32);
+    while over - fit > 1 {
+        let middle = (fit + over) / 2;
+        if fits(middle as f32) {
+            fit = middle;
+        } else {
+            over = middle;
+        }
+    }
+    Some(fit as f32)
+}
+
+/// One SVG side parsed, with only what the document carries.
+fn svg_tree(bytes: &[u8]) -> Option<resvg::usvg::Tree> {
+    use resvg::usvg::{ImageHrefResolver, Options, Tree};
+    let budget = std::sync::Arc::new(AtomicU64::new(EMBEDDED_BUDGET));
+    let over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (spent, refused) = (std::sync::Arc::clone(&budget), std::sync::Arc::clone(&over));
+    let mut options = Options {
+        // A reference to any other file is refused, so a changed SVG cannot
+        // make the pane open one.
+        image_href_resolver: ImageHrefResolver {
+            resolve_data: Box::new(move |mime, data, options| {
+                embedded(mime, data, options, &spent, &refused)
+            }),
+            resolve_string: Box::new(|_, _| {
+                REFUSED.fetch_add(1, Ordering::Relaxed);
+                None
+            }),
+        },
+        ..Options::default()
+    };
+    // `<text>`, or `<svg:text>` under a prefix.
+    if bytes
+        .windows(5)
+        .any(|window| window == b"<text" || window == b":text")
+    {
+        options.fontdb = fonts();
+    }
+    let tree = Tree::from_data(bytes, &options).ok()?;
+    (!over.load(Ordering::Relaxed)).then_some(tree)
+}
+
+/// One SVG side rendered, its long side at `long`.
+fn render_svg(tree: &resvg::usvg::Tree, long: f32) -> Option<RgbaImage> {
+    let size = tree.size();
+    let scale = long / size.width().max(size.height());
+    let width = (size.width() * scale).ceil().max(1.0) as u32;
+    let height = (size.height() * scale).ceil().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(
+        tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    RgbaImage::from_raw(width, height, pixmap.take_demultiplied())
+}
+
+/// Each side of a changed SVG rendered at one long side, so the two compare,
+/// or `None` when either cannot be drawn.
+fn svg_sides(job: &Job) -> Option<(Option<Decoded>, Option<Decoded>)> {
+    let tree = |source: &Option<Source>| match source {
+        Some(source) => svg_tree(&read_counted(source)?).map(Some),
+        None => Some(None),
+    };
+    let (old, new) = (tree(&job.sources.before)?, tree(&job.sources.after)?);
+    let sides: Vec<_> = [&old, &new]
+        .into_iter()
+        .flatten()
+        .map(|tree| (prices(tree), tree.size().width().max(tree.size().height())))
+        .collect();
+    let long = long_side(&sides)?;
+    let render = |tree: Option<resvg::usvg::Tree>| match tree {
+        Some(tree) => render_svg(&tree, long).map(|image| Some((image, None))),
+        None => Some(None),
+    };
+    Some((render(old)?, render(new)?))
+}
+
+/// A side decoded, and its colour profile.
+type Decoded = (RgbaImage, Option<Vec<u8>>);
+
+/// A side's bytes, counted as one decode.
+fn read_counted(source: &Source) -> Option<Vec<u8>> {
     let bytes = source.read()?;
     vigia_core::armed(Stage::Decode);
-    DECODES.fetch_add(1, Ordering::Relaxed);
-    if std::thread::current().name() != Some(WORKER) {
+    if std::thread::current().name() == Some(WORKER) {
+        DECODED.set(DECODED.get() + 1);
+    } else {
         OFF_WORKER.fetch_add(1, Ordering::Relaxed);
     }
+    Some(bytes)
+}
+
+/// One side decoded, with its colour profile. The first frame only.
+fn decode(source: &Source, raster: ImageFormat) -> Option<Decoded> {
+    use image::ImageDecoder;
+    let bytes = read_counted(source)?;
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
-    reader.set_format(image_format(format));
+    reader.set_format(raster);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_SIDE);
     limits.max_image_height = Some(MAX_SIDE);
@@ -916,14 +1319,16 @@ fn painted(mut image: RgbImage, hit: Option<&Hits>, paint: Paint, inks: Inks) ->
 /// panel. A side that does not decode builds nothing to draw.
 fn build(job: &Job, inks: Inks, picker: &Picker) -> Built {
     let side = |source: &Option<Source>, format: Option<Format>| match (source, format) {
-        (Some(source), Some(format)) => decode(source, format).map(Some),
+        (Some(source), Some(format)) => decode(source, image_format(format)?).map(Some),
         (None, None) => Some(None),
         _ => None,
     };
-    let (Some(old), Some(new)) = (
-        side(&job.sources.before, job.formats.0),
-        side(&job.sources.after, job.formats.1),
-    ) else {
+    let sides = if job.formats.0 == Some(Format::Svg) || job.formats.1 == Some(Format::Svg) {
+        svg_sides(job)
+    } else {
+        side(&job.sources.before, job.formats.0).zip(side(&job.sources.after, job.formats.1))
+    };
+    let Some((old, new)) = sides else {
         return undecoded();
     };
     let profiles_differ = matches!((&old, &new), (Some((_, a)), Some((_, b))) if a != b);
@@ -1002,6 +1407,203 @@ fn build(job: &Job, inks: Inks, picker: &Picker) -> Built {
 mod tests {
     use super::*;
     use image::Rgb;
+
+    #[test]
+    fn missing_family_falls_back() {
+        use resvg::usvg::fontdb::{Database, Family, Query};
+        let mut fonts = Database::new();
+        fonts.load_system_fonts();
+        if fonts.is_empty() {
+            eprintln!("note: this system has no fonts, so the fallback test proves nothing here");
+            return;
+        }
+        // As on a system without Times New Roman.
+        fonts.set_serif_family("No Such Family");
+        fallback_families(&mut fonts);
+        let found = fonts.query(&Query {
+            families: &[Family::Serif],
+            ..Query::default()
+        });
+        assert!(
+            found.is_some(),
+            "serif names no installed face, so a label draws nothing"
+        );
+    }
+
+    fn face(name: &str, monospaced: bool) -> FaceInfo {
+        FaceInfo {
+            id: resvg::usvg::fontdb::ID::dummy(),
+            name: name.to_owned(),
+            monospaced,
+        }
+    }
+
+    #[test]
+    fn fallback_draws_latin() {
+        let faces = [
+            face("Abyssinica SIL", false),
+            face("Noto Sans Symbols", false),
+            face("Ubuntu Sans", false),
+        ];
+        let latin =
+            |face: &FaceInfo| face.name != "Noto Sans Symbols" && face.name != "Abyssinica SIL";
+        assert_eq!(
+            fallback(&faces, SANS, sans_hint, latin).as_deref(),
+            Some("Ubuntu Sans"),
+            "a face with no Latin glyphs was chosen, so a label draws nothing"
+        );
+        assert_eq!(
+            fallback(&faces[..2], SANS, sans_hint, latin),
+            None,
+            "a face with no Latin glyphs was chosen as the last resort"
+        );
+    }
+
+    #[test]
+    fn fallback_prefers_known() {
+        let faces = [face("DejaVu Serif", false), face("Liberation Serif", false)];
+        assert_eq!(
+            fallback(&faces, SERIF, serif_hint, |_| true).as_deref(),
+            Some("Liberation Serif"),
+            "Times New Roman's metric stand-in was passed over"
+        );
+    }
+
+    #[test]
+    fn fallback_follows_hints() {
+        assert!(
+            !sans_hint(&face("Sansita Swashed", false)),
+            "a display face was hinted sans-serif for the letters in its name"
+        );
+        assert!(
+            !serif_hint(&face("Serifa", false)),
+            "a face was hinted serif for the letters in its name"
+        );
+        let serif = [face("Arimo", false), face("Gentium Serif", false)];
+        assert_eq!(
+            fallback(&serif, &[], serif_hint, |_| true).as_deref(),
+            Some("Gentium Serif"),
+            "serif fell back to a face its name does not call serif"
+        );
+        let sans = [face("Fira Sans Mono", true), face("Fira Sans", false)];
+        assert_eq!(
+            fallback(&sans, &[], sans_hint, |_| true).as_deref(),
+            Some("Fira Sans"),
+            "sans-serif fell back to a monospaced face"
+        );
+        let mono = [face("Hack", true), face("Monoton", false)];
+        assert_eq!(
+            fallback(&mono[1..], &[], mono_hint, |_| true).as_deref(),
+            Some("Monoton"),
+            "with no monospaced face, monospace found nothing"
+        );
+        assert_eq!(
+            fallback(
+                &[face("Monoton", false), face("Hack", true)],
+                &[],
+                mono_hint,
+                |_| true
+            )
+            .as_deref(),
+            Some("Hack"),
+            "monospace fell back to a face that is not monospaced"
+        );
+    }
+
+    #[test]
+    fn latin_coverage_read() {
+        assert!(
+            !covers_latin(b"not a font", 0),
+            "garbage read as a Latin face"
+        );
+        let mut fonts = resvg::usvg::fontdb::Database::new();
+        fonts.load_system_fonts();
+        if fonts.is_empty() {
+            eprintln!("note: this system has no fonts, so the coverage test proves less here");
+            return;
+        }
+        let read = |face: &FaceInfo| fonts.with_face_data(face.id, covers_latin);
+        let faces = faces_of(&fonts);
+        assert!(
+            faces.iter().any(|face| read(face) == Some(true)),
+            "no installed face reads as covering Latin"
+        );
+        // These emoji faces map digits but no letters (Segoe UI Emoji maps
+        // both); symbol faces map pictures
+        // onto the letters.
+        let named = |names: &[&str]| -> Vec<&FaceInfo> {
+            faces
+                .iter()
+                .filter(|face| names.contains(&face.name.as_str()))
+                .collect()
+        };
+        for (kind, names) in [
+            ("emoji", &["Apple Color Emoji", "Noto Color Emoji"][..]),
+            (
+                "symbol",
+                &["Wingdings", "Webdings", "Symbol", "OpenSymbol", "D050000L"][..],
+            ),
+        ] {
+            let found = named(names);
+            if found.is_empty() {
+                eprintln!("note: no {kind} face here");
+            }
+            for face in found {
+                assert_eq!(
+                    read(face),
+                    Some(false),
+                    "{} reads as covering Latin",
+                    face.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generics_fall_back() {
+        use resvg::usvg::fontdb::{Database, Family, Query};
+        let mut fonts = Database::new();
+        fonts.load_system_fonts();
+        if fonts.is_empty() {
+            eprintln!("note: this system has no fonts, so the fallback test proves nothing here");
+            return;
+        }
+        // As on a system without the defaults, and with serif on a face that
+        // draws no Latin.
+        let emoji = faces_of(&fonts)
+            .into_iter()
+            .find(|face| face.name.contains("Emoji"))
+            .map_or("No Such Family".to_owned(), |face| face.name);
+        fonts.set_serif_family(emoji);
+        fonts.set_sans_serif_family("No Such Family");
+        fonts.set_monospace_family("No Such Family");
+        fallback_families(&mut fonts);
+        for (family, monospaced) in [
+            (Family::Serif, None),
+            (Family::SansSerif, Some(false)),
+            (Family::Monospace, Some(true)),
+        ] {
+            let id = fonts
+                .query(&Query {
+                    families: &[family],
+                    ..Query::default()
+                })
+                .unwrap_or_else(|| panic!("{family:?} names no installed face"));
+            assert_eq!(
+                fonts.with_face_data(id, covers_latin),
+                Some(true),
+                "{family:?} names a face that draws no Latin"
+            );
+            if let Some(monospaced) = monospaced {
+                let face = fonts.face(id).expect("face");
+                assert_eq!(
+                    face.monospaced, monospaced,
+                    "{family:?} points at {}",
+                    face.families[0].0
+                );
+            }
+        }
+    }
 
     fn side(width: u32, height: u32) -> ImageSide {
         ImageSide {

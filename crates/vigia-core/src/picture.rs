@@ -25,6 +25,8 @@ pub enum Format {
     /// Truevision TGA, the one format with no signature, so it is known by its
     /// `.tga` name and then by its header.
     Tga,
+    /// An SVG document, known by its `.svg` name and its root `<svg>` tag.
+    Svg,
 }
 
 impl Format {
@@ -63,6 +65,7 @@ impl fmt::Display for Format {
             Self::Tiff => "TIFF",
             Self::Qoi => "QOI",
             Self::Tga => "TGA",
+            Self::Svg => "SVG",
         })
     }
 }
@@ -92,6 +95,149 @@ pub struct Picture {
     pub before: Option<ImageSide>,
     /// The worktree side, or the index's in the staged run.
     pub after: Option<ImageSide>,
+}
+
+/// How much of a worktree SVG the frame path reads for its size.
+pub(crate) const SVG_HEAD: u64 = 64 * 1024;
+
+/// Whether `path` is named as an SVG.
+pub(crate) fn svg_named(path: &str) -> bool {
+    path.rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("svg"))
+}
+
+/// One SVG side from the start of its document, which is `bytes` long: its
+/// size from the root tag, or `None`.
+pub(crate) fn svg_side(head: &[u8], bytes: u64) -> Option<ImageSide> {
+    // A blob arrives whole, and reads as far as a worktree side does.
+    let head = &head[..head.len().min(SVG_HEAD as usize)];
+    // A document an agent wrote must not be able to close the pane.
+    let (width, height) = crate::caught(|| svg_size(head)).flatten()?;
+    Some(ImageSide {
+        format: Format::Svg,
+        width,
+        height,
+        bytes,
+        stamp: 0,
+    })
+}
+
+/// The size an SVG's root `<svg>` start tag gives: `width` and `height` in
+/// pixels, or else its `viewBox`.
+fn svg_size(head: &[u8]) -> Option<(u32, u32)> {
+    use svgtypes::{Length, LengthUnit};
+    crate::armed(crate::Stage::Header);
+    let valid = match std::str::from_utf8(head) {
+        Ok(text) => text,
+        // Cut mid-character at the read limit.
+        Err(error) => std::str::from_utf8(&head[..error.valid_up_to()]).ok()?,
+    };
+    let attributes = root_attributes(valid.strip_prefix('\u{feff}').unwrap_or(valid))?;
+    let value = |name: &str| {
+        attributes
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| *value)
+    };
+    let view: Option<svgtypes::ViewBox> = value("viewBox").and_then(|view| view.parse().ok());
+    // A value that does not parse counts as absent, as usvg reads it.
+    let parsed = |name: &str| value(name).and_then(|value| value.parse::<Length>().ok());
+    let (width, height) = (parsed("width"), parsed("height"));
+    let font = parsed("font-size")
+        .filter(|size| matches!(size.unit, LengthUnit::None | LengthUnit::Px))
+        .map_or(12.0, |size| size.number);
+    // As usvg converts it, at 96 dpi: a percentage, or a missing side, is a
+    // share of the view box.
+    let resolve = |length: Option<Length>, of: f64| {
+        let Some(Length { number, unit }) = length else {
+            return of;
+        };
+        match unit {
+            LengthUnit::None | LengthUnit::Px => number,
+            LengthUnit::Em => number * font,
+            LengthUnit::Ex => number * font / 2.0,
+            LengthUnit::In => number * 96.0,
+            LengthUnit::Cm => number * 96.0 / 2.54,
+            LengthUnit::Mm => number * 96.0 / 25.4,
+            LengthUnit::Pt => number * 96.0 / 72.0,
+            LengthUnit::Pc => number * 96.0 / 6.0,
+            LengthUnit::Percent => of * number / 100.0,
+        }
+    };
+    let (width, height) = match view {
+        Some(view) => {
+            let (w, h) = (resolve(width, view.w), resolve(height, view.h));
+            // One side given alone takes the other from the view box's aspect.
+            match (width, height) {
+                (Some(_), None) => (w, w * view.h / view.w),
+                (None, Some(_)) => (h * view.w / view.h, h),
+                _ => (w, h),
+            }
+        }
+        // Without a view box, only two absolute sides are a size.
+        None => {
+            let absolute =
+                |length: Option<Length>| length.filter(|l| l.unit != LengthUnit::Percent);
+            let (width, height) = (absolute(width)?, absolute(height)?);
+            (resolve(Some(width), 0.0), resolve(Some(height), 0.0))
+        }
+    };
+    let side = |length: f64| {
+        (length.is_finite() && length > 0.0).then(|| length.ceil().min(f64::from(u32::MAX)) as u32)
+    };
+    Some((side(width)?, side(height)?))
+}
+
+/// The attributes of the document's root element when it is `<svg>`, past the
+/// prolog, comments and doctype.
+fn root_attributes(text: &str) -> Option<Vec<(&str, &str)>> {
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("<?") {
+            rest = &after[after.find("?>")? + 2..];
+        } else if let Some(after) = rest.strip_prefix("<!--") {
+            rest = &after[after.find("-->")? + 3..];
+        } else if let Some(after) = rest.strip_prefix("<!") {
+            // A doctype, whose internal subset in brackets can hold a `>`.
+            let end = after.find('>')?;
+            let past = match after.find('[') {
+                Some(open) if open < end => open + after[open..].find(']')?,
+                _ => 0,
+            };
+            rest = &after[past + after[past..].find('>')? + 1..];
+        } else {
+            break;
+        }
+    }
+    let tag = rest.strip_prefix("<svg")?;
+    if !tag.starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/') {
+        return None;
+    }
+    let mut attributes = Vec::new();
+    let mut rest = tag;
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with('>') || rest.starts_with("/>") {
+            return Some(attributes);
+        }
+        let equals = rest.find('=')?;
+        let name = rest[..equals].trim();
+        // A name that runs into another tag is a start tag that never closed.
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+        {
+            return None;
+        }
+        let after = rest[equals + 1..].trim_start();
+        let quote = after.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let body = &after[1..];
+        let end = body.find(quote)?;
+        attributes.push((name, &body[..end]));
+        rest = &body[end + 1..];
+    }
 }
 
 impl Picture {

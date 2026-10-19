@@ -16,10 +16,10 @@ const CLIMBING_LITERAL: &str = concat!("\"..", "/..");
 const SIBLING_LITERAL: &str = concat!("join(\"..", "\")");
 
 /// How many of `vigia`'s test files read outside the package.
-const ESCAPING_FILES: usize = 32;
+const ESCAPING_FILES: usize = 33;
 
 /// The English spelling of [`ESCAPING_FILES`], which is how the prose says it.
-const ESCAPING_FILES_SPELLED: &str = "thirty-two";
+const ESCAPING_FILES_SPELLED: &str = "thirty-three";
 
 /// The repository root, two levels above this package.
 fn repo_root() -> PathBuf {
@@ -2849,15 +2849,10 @@ const GRAVIOLA_MIRRORED: &str = "0.4.1";
 #[test]
 fn the_cpu_guard_still_mirrors_the_release_it_was_read_from() {
     let lock = repo_file("Cargo.lock");
-    let resolved = lock
-        .split("[[package]]")
-        .find(|block| block.contains("name = \"graviola\""))
-        .and_then(|block| {
-            block
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("version = "))
-        })
-        .map(|version| version.trim_matches('"').to_owned())
+    let resolved = lock_packages(&lock)
+        .find_map(|(name, version)| (name == "graviola").then_some(version))
+        .flatten()
+        .map(str::to_owned)
         .expect("Cargo.lock resolves graviola");
 
     assert_eq!(
@@ -3361,12 +3356,8 @@ fn threaded_codecs(lock: &str) -> Vec<String> {
     const CODECS: [&str; 10] = [
         "png", "jpeg", "jpg", "gif", "webp", "tiff", "avif", "heif", "dav1d", "turbo",
     ];
-    lock.split("[[package]]")
-        .filter_map(|block| {
-            let name = block
-                .lines()
-                .find_map(|line| line.strip_prefix("name = \""))?
-                .trim_end_matches('"');
+    lock_packages(lock)
+        .filter_map(|(name, _)| {
             let native = name.ends_with("-sys") && CODECS.iter().any(|codec| name.contains(codec));
             (name == "rayon" || native).then(|| name.to_owned())
         })
@@ -3387,5 +3378,43 @@ fn codecs_on_worker() {
         threaded_codecs(fixture),
         ["rayon", "libwebp-sys"],
         "the check no longer sees a thread pool or a native codec"
+    );
+}
+
+/// Each package in a lock, by name and version.
+fn lock_packages(lock: &str) -> impl Iterator<Item = (&str, Option<&str>)> {
+    lock.split("[[package]]").filter_map(|block| {
+        let field = |key: &str| {
+            block.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix(key)?
+                    .strip_prefix(" = ")
+                    .map(|value| value.trim_matches('"'))
+            })
+        };
+        Some((field("name")?, field("version")))
+    })
+}
+
+/// How many copies of `crate_name` the lock resolves.
+fn copies_of(lock: &str, crate_name: &str) -> usize {
+    lock_packages(lock)
+        .filter(|(name, _)| *name == crate_name)
+        .count()
+}
+
+#[test]
+fn one_skrifa() {
+    // `vigia` takes the requirement `usvg` declares, so the two unify.
+    assert_eq!(
+        copies_of(&repo_file("Cargo.lock"), "skrifa"),
+        1,
+        "vigia's skrifa and usvg's no longer resolve to one copy"
+    );
+    let split = "[[package]]\nname = \"skrifa\"\nversion = \"0.44.0\"\n\n[[package]]\nname = \"skrifa\"\nversion = \"0.45.0\"\n";
+    assert_eq!(
+        copies_of(split, "skrifa"),
+        2,
+        "the check no longer sees a second copy"
     );
 }
