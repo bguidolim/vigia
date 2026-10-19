@@ -202,12 +202,19 @@ pub(crate) fn file_stamp(meta: &std::fs::Metadata) -> u64 {
 /// bytes are a format the pane reads, or `named` says TGA, and the header after
 /// them holds.
 ///
-/// Reads the header and nothing past it.
+/// Reads the header and nothing past it. `None` outside when the decoder
+/// panicked, which more bytes would only repeat.
 pub(crate) fn side_of(
     source: impl BufRead + Seek,
     bytes: u64,
     named: Option<Format>,
-) -> Option<ImageSide> {
+) -> Option<Option<ImageSide>> {
+    // A header an agent wrote must not be able to close the pane.
+    crate::caught(|| header_of(source, bytes, named))
+}
+
+fn header_of(source: impl BufRead + Seek, bytes: u64, named: Option<Format>) -> Option<ImageSide> {
+    crate::armed(crate::Stage::Header);
     let mut reader = image::ImageReader::new(source).with_guessed_format().ok()?;
     if reader.format().is_none() && named == Some(Format::Tga) {
         reader.set_format(image::ImageFormat::Tga);

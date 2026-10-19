@@ -478,6 +478,8 @@ static OFF_WORKER: AtomicU64 = AtomicU64::new(0);
 /// The worker thread's name, which is how a decode knows where it runs.
 const WORKER: &str = "vigia-pictures";
 
+pub use vigia_core::{Stage, panic_next};
+
 /// How many images have been decoded so far.
 pub fn decodes() -> u64 {
     DECODES.load(Ordering::Relaxed)
@@ -529,7 +531,12 @@ impl Pictures {
                             shown.contains(&job.key)
                         },
                     );
-                    let built = wanted.then(|| build(&job, inks, &picker));
+                    // Everything one picture takes, decode to encode: a file an
+                    // agent wrote must not be able to close the pane.
+                    let built = wanted.then(|| {
+                        vigia_core::caught(|| build(&job, inks, &picker)).unwrap_or_else(undecoded)
+                    });
+                    vigia_core::armed(Stage::Worker);
                     if outbox.send((job.key, built)).is_err() {
                         break;
                     }
@@ -711,6 +718,7 @@ fn image_format(format: Format) -> ImageFormat {
 fn decode(source: &Source, format: Format) -> Option<(RgbaImage, Option<Vec<u8>>)> {
     use image::ImageDecoder;
     let bytes = source.read()?;
+    vigia_core::armed(Stage::Decode);
     DECODES.fetch_add(1, Ordering::Relaxed);
     if std::thread::current().name() != Some(WORKER) {
         OFF_WORKER.fetch_add(1, Ordering::Relaxed);
@@ -793,6 +801,7 @@ fn panel(
 ) -> Option<(SlicedProtocol, Option<u32>)> {
     let image = DynamicImage::ImageRgb8(painted(image, hit, paint, inks));
     let size = Size::new(slot.width, slot.rows);
+    vigia_core::armed(Stage::Encode);
     // Direct, because the picker's fit would read the grid as font pixels.
     if picker.protocol_type() == ProtocolType::Halfblocks {
         return Some((

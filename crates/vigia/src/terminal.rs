@@ -193,6 +193,8 @@ fn check_drawable(is_terminal: bool) -> io::Result<()> {
 
 /// Chain a restore onto the panic hook, once per process.
 fn install_hook() {
+    // Under the pane's own, so the pane ends the process whoever started it.
+    install_abort_hook();
     install_hook_in(&HOOK, || restore_everything(&mut Crossterm::on_stdout()));
 }
 
@@ -201,12 +203,43 @@ fn restore_everything<C: Console>(console: &mut C) {
     give_back_all(console, TAKEOVER.len());
 }
 
-/// Chain `restore` onto the panic hook, at most once per `once`.
+/// Chain `restore` onto the panic hook, at most once per `once`. A panic a
+/// picture's catch is waiting for is left to it.
 fn install_hook_in(once: &Once, restore: impl Fn() + Send + Sync + 'static) {
     once.call_once(|| {
         let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| on_panic(&restore, &previous, info)));
+        std::panic::set_hook(Box::new(move |info| {
+            if vigia_core::catching() {
+                return;
+            }
+            on_panic(&restore, &previous, info);
+        }));
     });
+}
+
+/// The panic hook every mode starts with: report the panic, then end the
+/// process, unless a picture's catch is waiting for it. The release build
+/// unwinds only for those catches; a thread that died quietly would leave a
+/// process that looks alive. It writes nothing to stdout, which `vigia mcp`
+/// speaks JSON on.
+pub fn install_abort_hook() {
+    static BASE: Once = Once::new();
+    BASE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if vigia_core::catching() {
+                return;
+            }
+            previous(info);
+            std::process::abort();
+        }));
+    });
+}
+
+/// The panic hook `run` installs, for a test that needs it in a child.
+#[doc(hidden)]
+pub fn install_panic_hook() {
+    install_hook();
 }
 
 /// The order the panic path runs in: restore, then whatever hook was there.
@@ -1163,9 +1196,24 @@ mod tests {
             );
 
             for skips in ["process::exit", "process::abort", "mem::forget"] {
-                assert!(
-                    !shipped.contains(skips),
+                // One abort is the base panic hook's, which the pane's hook runs
+                // only after it has restored the terminal.
+                let allowed = usize::from(name == "terminal.rs" && skips == "process::abort");
+                assert_eq!(
+                    shipped.matches(skips).count(),
+                    allowed,
                     "{name} calls {skips}, which skips the Drop that restores the terminal"
+                );
+            }
+            if name == "terminal.rs" {
+                let hook = shipped
+                    .split("pub fn install_abort_hook()")
+                    .nth(1)
+                    .and_then(|rest| rest.split("\n}\n").next())
+                    .expect("install_abort_hook");
+                assert!(
+                    hook.contains("process::abort"),
+                    "the one abort is not in the base panic hook"
                 );
             }
         }

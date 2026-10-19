@@ -16,10 +16,10 @@ const CLIMBING_LITERAL: &str = concat!("\"..", "/..");
 const SIBLING_LITERAL: &str = concat!("join(\"..", "\")");
 
 /// How many of `vigia`'s test files read outside the package.
-const ESCAPING_FILES: usize = 31;
+const ESCAPING_FILES: usize = 32;
 
 /// The English spelling of [`ESCAPING_FILES`], which is how the prose says it.
-const ESCAPING_FILES_SPELLED: &str = "thirty-one";
+const ESCAPING_FILES_SPELLED: &str = "thirty-two";
 
 /// The repository root, two levels above this package.
 fn repo_root() -> PathBuf {
@@ -2841,8 +2841,8 @@ const GRAVIOLA_MIRRORED: &str = "0.4.1";
 
 /// The mirrored CPU-feature list is pinned to the release it was read from.
 ///
-/// The guard exists because graviola asserts rather than degrades and this
-/// workspace aborts rather than unwinds, so a feature added upstream is a dead
+/// The guard exists because graviola asserts rather than degrades and a panic
+/// outside a picture's catch aborts, so a feature added upstream is a dead
 /// monitor on hardware nobody here can test. A caret range would take that
 /// silently, and no test of the guard's own behaviour can see it: the guard
 /// keeps answering, about the wrong list.
@@ -3352,5 +3352,40 @@ fn dist_install_retries() {
         step.contains("for attempt in") && step.contains("break") && step.contains("|| exit 1"),
         "the cargo-dist install does not retry and then fail, so one bad download \
          either fails the build or is swallowed:\n{step}"
+    );
+}
+
+/// The packages in `lock` that could run a picture's decode on a thread of
+/// their own, or in C: a thread pool, or a codec built on a native library.
+fn threaded_codecs(lock: &str) -> Vec<String> {
+    const CODECS: [&str; 10] = [
+        "png", "jpeg", "jpg", "gif", "webp", "tiff", "avif", "heif", "dav1d", "turbo",
+    ];
+    lock.split("[[package]]")
+        .filter_map(|block| {
+            let name = block
+                .lines()
+                .find_map(|line| line.strip_prefix("name = \""))?
+                .trim_end_matches('"');
+            let native = name.ends_with("-sys") && CODECS.iter().any(|codec| name.contains(codec));
+            (name == "rayon" || native).then(|| name.to_owned())
+        })
+        .collect()
+}
+
+/// The panic hook tells the picture worker apart by its thread's name, so a
+/// decoder that panics on a thread of its own would abort the pane after all.
+#[test]
+fn codecs_on_worker() {
+    assert_eq!(
+        threaded_codecs(&repo_file("Cargo.lock")),
+        Vec::<String>::new(),
+        "a decode could now run outside a picture's catch, where the panic hook aborts"
+    );
+    let fixture = "[[package]]\nname = \"rayon\"\n\n[[package]]\nname = \"libwebp-sys\"\n\n[[package]]\nname = \"png\"\n";
+    assert_eq!(
+        threaded_codecs(fixture),
+        ["rayon", "libwebp-sys"],
+        "the check no longer sees a thread pool or a native codec"
     );
 }
