@@ -13,7 +13,7 @@ use vigia::{
 };
 use vigia_core::{HISTORY_SAMPLE, Highlighter, History, LineKind, Standing};
 
-use support::Scratch;
+use support::{Scratch, png};
 
 /// Tall enough that nothing is scrolled off, so the whole diff is asserted.
 const ALL_ROWS: usize = 500;
@@ -800,6 +800,46 @@ fn a_binary_file_adds_nothing_and_says_nothing() {
         view.churn.map(|run| run.binary),
         Some(1),
         "the binary file is not counted where the header would say so"
+    );
+}
+
+#[test]
+fn image_size_line() {
+    let scratch = Scratch::new("shell-rows-image");
+    scratch.write("assets/home.png", png(24, 40, 1));
+    scratch.commit_all("baseline");
+    scratch.write("assets/home.png", png(30, 50, 2));
+
+    let worktree = scratch.worktree();
+    let mut frame = worktree.frame();
+    frame.advance().expect("advance");
+    let mut app = App::new();
+    let mut highlighter = Highlighter::eager();
+    let history = History::new();
+    let view = app
+        .view(
+            &mut frame,
+            &mut highlighter,
+            &history,
+            Body::diff_only(ALL_ROWS),
+        )
+        .expect("view");
+
+    let Some(Row::Reason(line)) = view.rows.get(1) else {
+        panic!(
+            "an image drew {:?} where its size line should be",
+            view.rows.get(1)
+        );
+    };
+    assert!(
+        line.starts_with("PNG 24×40 → 30×50 · "),
+        "the size line reads {line:?}"
+    );
+    assert_eq!(view.rows.len(), 2, "an image drew extra rows");
+    let churn = frame.churn().expect("churn").expect("a churn");
+    assert_eq!(
+        churn.binary, 1,
+        "the header stopped counting an image as binary"
     );
 }
 

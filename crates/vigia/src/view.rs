@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 
 use vigia_core::{
-    ChangeKind, Churn, FileDiff, Frame, HISTORY_BUCKETS, Highlighter, History, Hunk, LineKind,
-    LineRef, Note, Origin, Pass, Placement, Recency, Result, SPARK_GROUPS, Side, Span, Status,
-    first_of, resolve, run_of,
+    ChangeKind, Churn, FileDiff, Frame, HISTORY_BUCKETS, Highlighter, History, Hunk, ImageSide,
+    LineKind, LineRef, Note, Origin, Pass, Picture, Placement, Recency, Result, SPARK_GROUPS, Side,
+    Span, Status, first_of, resolve, run_of,
 };
 
 use crate::quote::{Chunk, CodeRow, Run};
@@ -1407,21 +1407,81 @@ fn letter(kind: &ChangeKind) -> char {
     }
 }
 
+/// Whether a file draws a one-line stand-in rather than hunks, without building
+/// the line: [`note_for`] formats an image's.
+fn noted(kind: &ChangeKind, diff: &FileDiff) -> bool {
+    matches!(kind, ChangeKind::Conflict | ChangeKind::TypeChange)
+        || diff.unreadable.is_some()
+        || diff.binary
+}
+
 /// The one-line stand-in for a file with no line-level diff, if it needs one.
-fn note_for<'a>(kind: &ChangeKind, diff: &'a FileDiff) -> Option<&'a str> {
+fn note_for(kind: &ChangeKind, diff: &FileDiff) -> Option<String> {
+    if !noted(kind, diff) {
+        return None;
+    }
     match kind {
-        ChangeKind::Conflict => Some("unresolved conflict"),
-        ChangeKind::TypeChange => Some("type changed"),
+        ChangeKind::Conflict => Some("unresolved conflict".to_owned()),
+        ChangeKind::TypeChange => Some("type changed".to_owned()),
         _ => diff
             .unreadable
-            .as_deref()
-            .or_else(|| diff.binary.then_some("binary")),
+            .clone()
+            .or_else(|| diff.picture.as_ref().and_then(size_line))
+            .or_else(|| diff.binary.then(|| "binary".to_owned())),
+    }
+}
+
+/// What a changed image is, in one line: `PNG 1242×2688 · 731 KiB → 748 KiB`.
+/// A part the two sides share is said once.
+fn size_line(picture: &Picture) -> Option<String> {
+    let size = |side: &ImageSide| format!("{}×{}", side.width, side.height);
+    let shape = |side: &ImageSide| format!("{} {}", side.format, size(side));
+    let either = |old: String, new: String| {
+        if old == new {
+            old
+        } else {
+            format!("{old} → {new}")
+        }
+    };
+    Some(match (&picture.before, &picture.after) {
+        (Some(old), Some(new)) => {
+            let shapes = if old.format == new.format {
+                format!("{} {}", new.format, either(size(old), size(new)))
+            } else {
+                format!("{} → {}", shape(old), shape(new))
+            };
+            let sizes = match (file_size(old.bytes), file_size(new.bytes)) {
+                _ if old.bytes == new.bytes => file_size(new.bytes),
+                // Rounding would hide the change, so the bytes are said exactly.
+                (rounded, again) if rounded == again => {
+                    format!("{} B → {} B", old.bytes, new.bytes)
+                }
+                (old, new) => format!("{old} → {new}"),
+            };
+            format!("{shapes} · {sizes}")
+        }
+        (Some(one), None) | (None, Some(one)) => {
+            format!("{} · {}", shape(one), file_size(one.bytes))
+        }
+        (None, None) => return None,
+    })
+}
+
+/// A file's length in binary units: `900 B`, `731 KiB`, `2.1 MiB`.
+fn file_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * KIB;
+    let kib = (bytes + KIB / 2) / KIB;
+    match bytes {
+        0..KIB => format!("{bytes} B"),
+        _ if kib < KIB => format!("{kib} KiB"),
+        _ => format!("{:.1} MiB", bytes as f64 / MIB as f64),
     }
 }
 
 /// Rows one file contributes: its heading, then either a note or its hunks.
 fn span_of(kind: &ChangeKind, diff: &FileDiff) -> usize {
-    if note_for(kind, diff).is_some() {
+    if noted(kind, diff) {
         return 2;
     }
     1 + diff.hunks.iter().map(hunk_span).sum::<usize>()
@@ -1462,7 +1522,7 @@ fn block_of(kind: &ChangeKind, diff: &FileDiff, index: usize, files: usize) -> u
 
 /// Rows into a file's block where follow should put the top of the viewport.
 fn landing_of(kind: &ChangeKind, diff: &FileDiff, height: usize, content: Option<usize>) -> usize {
-    if note_for(kind, diff).is_some() {
+    if noted(kind, diff) {
         return 0;
     }
 
@@ -1587,7 +1647,7 @@ fn entry_of(
         origin,
         from: kind.source().map(str::to_owned),
         kind: letter(kind),
-        churn: (note_for(kind, diff).is_none()).then_some((diff.added, diff.removed)),
+        churn: (!noted(kind, diff)).then_some((diff.added, diff.removed)),
         spark: history
             .and_then(|watch| watch.level(&diff.path))
             .unwrap_or([0; HISTORY_BUCKETS]),
@@ -1601,7 +1661,7 @@ fn entry_of(
 /// How many rows a file occupies, from its span rather than from its diff.
 pub fn rows_of(change: &vigia_core::FileChange, span: &vigia_core::FileSpan) -> usize {
     // A note is a heading and one line saying why, which is exactly what
-    // `note_for` produces for the same four cases.
+    // `noted` answers for the same four cases.
     if matches!(change.kind, ChangeKind::Conflict | ChangeKind::TypeChange)
         || span.binary
         || span.unreadable
@@ -2799,9 +2859,12 @@ impl View {
 
         // A labelled block so the block's closing gap has one push site.
         'block: {
-            if let Some(reason) = note_for(kind, diff) {
-                if n >= skip && self.rows.len() < height {
-                    self.rows.push(Row::Reason(reason.to_owned()));
+            if noted(kind, diff) {
+                if n >= skip
+                    && self.rows.len() < height
+                    && let Some(reason) = note_for(kind, diff)
+                {
+                    self.rows.push(Row::Reason(reason));
                 }
                 n += 1;
                 break 'block;
@@ -3179,7 +3242,54 @@ mod tests {
             lines,
             first_line: None,
             bytes: 0,
+            picture: None,
         }
+    }
+
+    fn image(format: vigia_core::Format, width: u32, height: u32, bytes: u64) -> ImageSide {
+        ImageSide {
+            format,
+            width,
+            height,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn size_line_shapes() {
+        use vigia_core::Format::{Jpeg, Png};
+        let line = |before, after| size_line(&Picture { before, after }).expect("a side");
+        let old = image(Png, 1242, 2688, 748_544);
+        assert_eq!(
+            line(Some(old), Some(image(Png, 1242, 2688, 765_952))),
+            "PNG 1242×2688 · 731 KiB → 748 KiB"
+        );
+        assert_eq!(
+            line(Some(old), Some(image(Png, 1179, 2556, 748_544))),
+            "PNG 1242×2688 → 1179×2556 · 731 KiB"
+        );
+        assert_eq!(
+            line(Some(old), Some(image(Jpeg, 1242, 2688, 2_200_000))),
+            "PNG 1242×2688 → JPEG 1242×2688 · 731 KiB → 2.1 MiB"
+        );
+        assert_eq!(
+            line(None, Some(image(Png, 16, 12, 900))),
+            "PNG 16×12 · 900 B"
+        );
+        assert_eq!(line(Some(old), None), "PNG 1242×2688 · 731 KiB");
+        assert_eq!(
+            line(Some(old), Some(image(Png, 1242, 2688, 748_600))),
+            "PNG 1242×2688 · 748544 B → 748600 B"
+        );
+    }
+
+    #[test]
+    fn file_size_units() {
+        assert_eq!(file_size(1023), "1023 B");
+        assert_eq!(file_size(1024), "1 KiB");
+        assert_eq!(file_size(1_048_000), "1023 KiB");
+        assert_eq!(file_size(1_048_100), "1.0 MiB");
+        assert_eq!(file_size(2_200_000), "2.1 MiB");
     }
 
     /// A hunk starting at working-tree line `new_start` with these line kinds.
