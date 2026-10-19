@@ -11,7 +11,7 @@ use crate::filter::Filter;
 use crate::frame::{Fingerprint, Frame, config_moved, followed_print};
 use crate::hidden::Hidden;
 use crate::hunk::{self, FileDiff};
-use crate::picture::{self, Format, ImageSide, Picture};
+use crate::picture::{self, Format, ImageSide, Picture, Source, Sources};
 use crate::standing::Standing;
 use crate::watch::{WatchOptions, Watcher};
 
@@ -594,6 +594,9 @@ impl Worktree {
             // Nothing was sniffed when the attribute decided.
             let sniffed = (diff != Some(false)).then_some(window.as_slice());
             binary.picture = self.early_picture(change, sniffed, &mut binary.bytes);
+            if let Some(picture) = binary.picture.as_mut() {
+                self.stamp(change, picture);
+            }
             return Ok(binary);
         }
         let (before, after) = self.sides(change, probes)?;
@@ -609,6 +612,9 @@ impl Worktree {
                 .map(|_| self.held_side(&after, named, &mut cost));
             diff.bytes += cost;
             diff.picture = Picture::of(before, after);
+            if let Some(picture) = diff.picture.as_mut() {
+                self.stamp(change, picture);
+            }
         }
         Ok(diff)
     }
@@ -673,23 +679,69 @@ impl Worktree {
 
     /// The object an LFS pointer names, from this repository's local store.
     fn lfs_side(&self, oid: &str, named: Option<Format>, cost: &mut u64) -> Option<ImageSide> {
+        let path = self.lfs_path(oid)?;
+        self.file_side(&path, false, named, cost)
+    }
+
+    /// Where the LFS object `oid` is stored, when it is a file there. Followed, so
+    /// a store reached through a link reads, and a fifo is never opened.
+    fn lfs_path(&self, oid: &str) -> Option<PathBuf> {
+        let path = picture::lfs_object(&self.lfs_store(), oid);
+        std::fs::metadata(&path)
+            .is_ok_and(|meta| meta.is_file())
+            .then_some(path)
+    }
+
+    /// This repository's LFS store: `lfs.storage`, or `lfs` under the common
+    /// git directory.
+    fn lfs_store(&self) -> PathBuf {
         let repo = self.repo();
         let common = repo.common_dir();
-        let store = match repo.config_snapshot().trusted_path("lfs.storage") {
+        match repo.config_snapshot().trusted_path("lfs.storage") {
             Ok(Some(path)) => common.join(path),
             _ => common.join("lfs"),
-        };
-        drop(repo);
-        let path = store
-            .join("objects")
-            .join(&oid[0..2])
-            .join(&oid[2..4])
-            .join(oid);
-        // Followed, so a store reached through a link reads, and a fifo is never opened.
-        if !std::fs::metadata(&path).is_ok_and(|meta| meta.is_file()) {
-            return None;
         }
-        self.file_side(&path, false, named, cost)
+    }
+
+    /// Where both sides of a changed image can be read from on another thread.
+    /// Nothing is read here but a short worktree file that may be an LFS pointer.
+    pub fn image_sources(&self, change: &FileChange) -> Sources {
+        let blob = |id| Source::Blob {
+            git_dir: self.repo().git_dir().to_owned(),
+            id,
+            store: self.lfs_store(),
+        };
+        let after = match change.after {
+            Some(Side::Blob(id)) => Some(blob(id)),
+            Some(Side::Worktree) => {
+                let path = self.workdir.join(&change.path);
+                let pointer = std::fs::metadata(&path)
+                    .ok()
+                    .filter(|meta| meta.len() < picture::POINTER_MAX as u64)
+                    .and_then(|_| std::fs::read(&path).ok())
+                    .and_then(|head| picture::lfs_oid(&head).and_then(|oid| self.lfs_path(oid)));
+                Some(Source::File(pointer.unwrap_or(path)))
+            }
+            None => None,
+        };
+        Sources {
+            before: change.before.map(blob),
+            after,
+        }
+    }
+
+    /// Fill each side's stamp: the blob's id, or the worktree file's `stat`.
+    fn stamp(&self, change: &FileChange, picture: &mut Picture) {
+        if let (Some(side), Some(id)) = (picture.before.as_mut(), change.before) {
+            side.stamp = picture::blob_stamp(&id);
+        }
+        if let Some(side) = picture.after.as_mut() {
+            side.stamp = match change.after {
+                Some(Side::Blob(id)) => picture::blob_stamp(&id),
+                _ => std::fs::metadata(self.workdir.join(&change.path))
+                    .map_or(0, |meta| picture::file_stamp(&meta)),
+            };
+        }
     }
 
     /// A file's side, read through its header in the steps of

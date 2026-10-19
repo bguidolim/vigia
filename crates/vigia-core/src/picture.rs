@@ -78,6 +78,10 @@ pub struct ImageSide {
     pub height: u32,
     /// The whole file's length, read or not.
     pub bytes: u64,
+    /// What this side's content is, as far as the pane can tell without hashing
+    /// it: its blob id, or its file's length, time and inode. Two sides with one
+    /// stamp hold the same image.
+    pub stamp: u64,
 }
 
 /// Both sides of a changed image. A side is `None` where the change has none:
@@ -108,6 +112,92 @@ impl Picture {
     }
 }
 
+/// Where one side of a changed image can be read from, by a reader on another
+/// thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// A blob in the repository at `git_dir`. One that is an LFS pointer is read
+    /// from `store` instead.
+    Blob {
+        /// The repository's git directory.
+        git_dir: std::path::PathBuf,
+        /// The blob.
+        id: gix::ObjectId,
+        /// The repository's LFS store.
+        store: std::path::PathBuf,
+    },
+    /// A working-tree file, or the LFS object a pointer in it names.
+    File(std::path::PathBuf),
+}
+
+impl Source {
+    /// This side's bytes, read on the calling thread. `None` when they cannot be.
+    pub fn read(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::File(path) => read_file(path),
+            Self::Blob { git_dir, id, store } => {
+                // Opened per read, so the worker keeps no repository handle of its own.
+                let repo = gix::open(git_dir).ok()?;
+                let bytes = repo
+                    .find_object(*id)
+                    .ok()?
+                    .try_into_blob()
+                    .ok()?
+                    .take_data();
+                match lfs_oid(&bytes) {
+                    Some(oid) => read_file(&lfs_object(store, oid)),
+                    None => Some(bytes),
+                }
+            }
+        }
+    }
+}
+
+/// Where the LFS object `oid` is kept in `store`.
+pub(crate) fn lfs_object(store: &std::path::Path, oid: &str) -> std::path::PathBuf {
+    store
+        .join("objects")
+        .join(&oid[0..2])
+        .join(&oid[2..4])
+        .join(oid)
+}
+
+/// A regular file's bytes. Followed, so a link to one reads, and a fifo is never
+/// opened.
+fn read_file(path: &std::path::Path) -> Option<Vec<u8>> {
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file())
+        .then(|| std::fs::read(path).ok())
+        .flatten()
+}
+
+/// Both sides of a changed image, as [`Source`]s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sources {
+    /// The index side, or `HEAD`'s in the staged run.
+    pub before: Option<Source>,
+    /// The worktree side, or the index's in the staged run.
+    pub after: Option<Source>,
+}
+
+/// A blob's stamp, from its id.
+pub(crate) fn blob_stamp(id: &gix::ObjectId) -> u64 {
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&id.as_bytes()[..8]);
+    u64::from_le_bytes(head)
+}
+
+/// A file's stamp, from what `stat` says of it.
+pub(crate) fn file_stamp(meta: &std::fs::Metadata) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    meta.len().hash(&mut hasher);
+    meta.modified().ok().hash(&mut hasher);
+    #[cfg(unix)]
+    std::os::unix::fs::MetadataExt::ino(meta).hash(&mut hasher);
+    hasher.finish()
+}
+
 /// One side read from `source`, which is `bytes` long: `None` unless the first
 /// bytes are a format the pane reads, or `named` says TGA, and the header after
 /// them holds.
@@ -129,6 +219,7 @@ pub(crate) fn side_of(
         width,
         height,
         bytes,
+        stamp: 0,
     })
 }
 
