@@ -81,7 +81,9 @@ pub use render::{
     diff_height, menu_cell, note_cells, notice_area, positions_gap, regions, render, voice_style,
 };
 pub use state::state_root;
-pub use terminal::{Background, Colours, Screen, Session, background_of, colours_of};
+pub use terminal::{
+    Background, Colours, PICTURES_WAIT, Screen, Session, background_of, colours_of, picker,
+};
 pub use theme::{THEME_FILE, THEME_VAR, Theme, ThemeError};
 pub use update::{UPDATE_VAR, UpdateError};
 pub use view::{
@@ -347,6 +349,11 @@ pub fn run(path: &Path) -> Result<(), Failure> {
     // environment anything. An unrecognised value is refused, not defaulted.
     let glyphs = Glyphs::detect()?;
 
+    // Only the override is read here, so a value it refuses is reported on a
+    // terminal the reader can still read. The query itself waits for the first
+    // paint.
+    let forced = pictures::forced(&|key: &str| std::env::var(key).ok())?;
+
     // Here rather than inside `App` for the palette's reason: a config file that
     // does not parse has to be reported on a terminal the reader can still read.
     // `SPEC.md` §11.2 B6.
@@ -385,7 +392,7 @@ pub fn run(path: &Path) -> Result<(), Failure> {
     let armed = signal::forward(tx.clone());
 
     let pictured = tx.clone();
-    let pictures = pictures::Pictures::new(
+    let pictures = pictures::Pictures::unpicked(
         pictures::Inks::of(
             &theme,
             colours.as_ref().map(|colours| colours.background),
@@ -448,8 +455,9 @@ pub fn run(path: &Path) -> Result<(), Failure> {
         effects_ran: false,
     };
 
-    // A half-block is a background, and below 24-bit a background is dropped.
-    shell.app.draw_pictures(depth == Depth::Truecolor);
+    // Half-blocks until the picture query has answered, after the first paint.
+    let truecolour = depth == Depth::Truecolor;
+    shell.app.draw_pictures(truecolour);
 
     // The arming from above, reported now that there is somewhere to report it. A
     // signal that arrived before this point is not lost: it waits in the channel
@@ -485,6 +493,30 @@ pub fn run(path: &Path) -> Result<(), Failure> {
     // opening is one mechanism rather than two statements in a row that a future edit
     // can separate.
     shell.draw(&mut frame, &worktree, &mut aside, Instant::now())?;
+
+    // After the first paint, so a terminal slow to answer delays only the
+    // pictures, and before the input thread, which would read the answer as
+    // keys. `SPEC.md` §11.1.
+    // Unix asks only a terminal that answered the background query; Windows,
+    // which sends no other, always asks. Forced half-blocks need no answer.
+    let ask = forced != Some(ratatui_image::picker::ProtocolType::Halfblocks)
+        && (cfg!(windows) || !reply.is_empty());
+    let (mut picker, answer) = terminal::picker(ask);
+    picker.set_protocol_type(pictures::protocol_of(forced, answer, &|key: &str| {
+        std::env::var(key).ok()
+    }));
+    shell
+        .app
+        .draw_pictures(pictures::drawn(truecolour, picker.protocol_type()));
+    shell.pictures.pick(picker);
+    if ask {
+        // On Windows the query drops a resize that came in during it, and it is
+        // sent blind there, so it may have printed.
+        if cfg!(windows) {
+            let _ = shell.session.screen().clear();
+        }
+        shell.draw(&mut frame, &worktree, &mut aside, Instant::now())?;
+    }
 
     // Armed only now.
     spawn_watch(path.to_path_buf(), tx.clone(), shell.hide.clone());
@@ -1130,7 +1162,32 @@ struct Shell {
     effects_ran: bool,
 }
 
+// On every way out, while the screen is still this pane's: the terminal keeps
+// a Kitty image past this process until told.
+impl Drop for Shell {
+    fn drop(&mut self) {
+        self.pictures.retire_all();
+        self.write_retired();
+        use std::io::Write;
+        let _ = self.session.screen().backend_mut().flush();
+    }
+}
+
 impl Shell {
+    /// Send the Kitty deletes owed. A failed write leaves the images to the
+    /// terminal's own quota.
+    fn write_retired(&mut self) {
+        use std::io::Write;
+        let retired = self.pictures.retired();
+        if !retired.is_empty() {
+            let _ = self
+                .session
+                .screen()
+                .backend_mut()
+                .write_all(retired.as_bytes());
+        }
+    }
+
     /// The diff region's height for `action`, or zero where it reads none.
     fn diff_rows_for(
         &mut self,
@@ -2153,6 +2210,9 @@ impl Shell {
             self.elsewhere,
             &self.root,
         );
+        // Before the draw, so the terminal drops the Kitty images of pictures that
+        // left the screen.
+        self.write_retired();
         // Borrowed out of `self` before the draw, not for style: the closure would
         // otherwise hold `&self` while `self.session` is borrowed mutably to reach
         // the terminal.
@@ -3206,6 +3266,36 @@ mod tests {
             wrote < posted,
             "`commit_box` posts before it writes, so a socket could take a note \
              the store then refuses"
+        );
+    }
+
+    #[test]
+    fn picture_query_after_paint() {
+        let source = include_str!("lib.rs");
+        let shipped = source.split("#[cfg(test)]").next().expect("split");
+        let code: String = shipped
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let first_paint = code
+            .find("shell.draw(&mut frame, &worktree, &mut aside, Instant::now())?")
+            .expect("`run` no longer paints before the loop");
+        let query = code
+            .find("terminal::picker(")
+            .expect("`run` no longer asks for the picture protocol");
+        let input = code
+            .find("spawn_input(tx.clone())")
+            .expect("`run` no longer spawns the input thread");
+        assert!(
+            first_paint < query && query < input,
+            "the picture query runs before the first paint, which it would delay, \
+             or after the input thread, which would read its answer as keys"
+        );
+        assert_eq!(
+            code.matches("terminal::picker(").count(),
+            1,
+            "the picture query is asked more than once"
         );
     }
 

@@ -324,7 +324,6 @@ fn answered(reply: &[u8], palette: bool) -> bool {
 }
 
 /// How long a terminal that has begun answering the palette is given to finish.
-#[cfg(any(unix, test))]
 const ANSWERING: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long [`ask`] waits in all. A terminal that has begun answering the
@@ -396,6 +395,75 @@ pub fn ask(timeout: std::time::Duration, palette: bool) -> Vec<u8> {
 #[cfg(not(unix))]
 pub fn ask(_timeout: std::time::Duration, _palette: bool) -> Vec<u8> {
     Vec::new()
+}
+
+/// How long the picture query waits for the terminal's status answer, which
+/// ends it. On Unix it asks only a terminal that answered the background query,
+/// so it gives it `ANSWERING`, the wait a palette answer that has begun gets.
+/// Windows asks blind, so it waits the background query's first wait.
+pub const PICTURES_WAIT: std::time::Duration = if cfg!(unix) {
+    ANSWERING
+} else {
+    std::time::Duration::from_millis(150)
+};
+
+/// Ask the terminal which image protocol it draws and its cell size in pixels,
+/// through `ratatui-image`'s own query, or with `ask` false give the half-blocks
+/// answer without asking. Called in raw mode: the crate leaves its own on when
+/// its query times out, and only the session's exit undoes it.
+pub fn picker(ask: bool) -> (ratatui_image::picker::Picker, crate::pictures::Answer) {
+    use ratatui_image::picker::{Capability, Picker, cap_parser::QueryStdioOptions};
+    let unknown = || (Picker::halfblocks(), crate::pictures::Answer::default());
+    if !ask {
+        return unknown();
+    }
+    debug_assert!(
+        ratatui::crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
+        "the picture query ran outside raw mode"
+    );
+    let options = QueryStdioOptions {
+        timeout_ms: PICTURES_WAIT.as_millis() as i32,
+        #[cfg(unix)]
+        stdio: query_stdio(),
+        ..QueryStdioOptions::default()
+    };
+    let Ok(picker) = Picker::from_query_stdio_with_options(options) else {
+        return unknown();
+    };
+    let font = picker.font_size();
+    if font.width == 0 || font.height == 0 {
+        return unknown();
+    }
+    let caps = picker.capabilities();
+    // The terminal's own size in pixels, which the crate's fallback reads too.
+    let sized = ratatui::crossterm::terminal::window_size()
+        .is_ok_and(|size| size.width > 0 && size.height > 0 && size.columns > 0 && size.rows > 0);
+    let heard = caps
+        .iter()
+        .any(|cap| matches!(cap, Capability::CellSize(Some(_))));
+    let answer = crate::pictures::Answer {
+        kitty: caps.contains(&Capability::Kitty),
+        sixel: caps.contains(&Capability::Sixel),
+        cell: sized || heard,
+        heard,
+    };
+    (picker, answer)
+}
+
+/// The descriptors the picture query reads and writes: the terminal's own when
+/// both ends are one, else `/dev/tty`. macOS answers `poll` on `/dev/tty` with
+/// `POLLNVAL`, so there the query reads nothing through it.
+#[cfg(unix)]
+fn query_stdio() -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::AsFd;
+    let (stdin, stdout) = (io::stdin(), stdout());
+    if stdin.is_terminal() && stdout.is_terminal() {
+        return Some((
+            stdin.as_fd().try_clone_to_owned().ok()?,
+            stdout.as_fd().try_clone_to_owned().ok()?,
+        ));
+    }
+    ratatui_image::picker::cap_parser::QueryStdioOptions::stdio_dev_tty().ok()
 }
 
 #[cfg(test)]

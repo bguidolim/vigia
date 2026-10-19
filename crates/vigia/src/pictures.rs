@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use image::{DynamicImage, ImageFormat, RgbImage, RgbaImage};
 use ratatui::layout::Size;
+use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::halfblocks::Halfblocks;
 use ratatui_image::sliced::SlicedProtocol;
 use vigia_core::{Format, ImageSide, Picture, Source, Sources};
@@ -225,6 +226,8 @@ pub struct Built {
     pub verdict: Verdict,
     /// Whether the two sides carry different colour profiles.
     pub profiles_differ: bool,
+    /// The ids of its Kitty images, which the terminal holds until told to drop them.
+    pub kitty: Vec<u32>,
 }
 
 impl Built {
@@ -295,6 +298,133 @@ impl Inks {
     }
 }
 
+/// Environment variable that overrides the protocol outright.
+pub const PICTURES_VAR: &str = "VIGIA_PICTURES";
+
+/// A [`PICTURES_VAR`] this does not understand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PicturesError {
+    /// What was found in the variable.
+    pub value: String,
+}
+
+impl std::fmt::Display for PicturesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{PICTURES_VAR}: {:?} is not one of auto, kitty, sixel, iterm2, halfblocks",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for PicturesError {}
+
+/// What the terminal said it can draw, and whether its cell size in pixels is
+/// known from the answer or from the terminal's own size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Answer {
+    /// It answered the Kitty graphics query.
+    pub kitty: bool,
+    /// Its device attributes include Sixel.
+    pub sixel: bool,
+    /// Its cell size in pixels is known.
+    pub cell: bool,
+    /// It answered with its cell size, so a protocol it did not claim is absent.
+    pub heard: bool,
+}
+
+/// Which protocol draws the pictures: the override, then the answer, then the
+/// table of terminals, then half-blocks.
+pub fn protocol_of(
+    forced: Option<ProtocolType>,
+    answer: Answer,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> ProtocolType {
+    forced.unwrap_or_else(|| detected(answer, lookup))
+}
+
+/// The protocol [`PICTURES_VAR`] names, or `None` for `auto` or unset.
+pub fn forced(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<ProtocolType>, PicturesError> {
+    let Some((raw, value)) = crate::colour::override_of(lookup, PICTURES_VAR) else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        "kitty" => Ok(Some(ProtocolType::Kitty)),
+        "sixel" => Ok(Some(ProtocolType::Sixel)),
+        "iterm2" => Ok(Some(ProtocolType::Iterm2)),
+        "halfblocks" => Ok(Some(ProtocolType::Halfblocks)),
+        "auto" => Ok(None),
+        _ => Err(PicturesError { value: raw }),
+    }
+}
+
+/// The protocol the answer and the table give, without the override.
+pub fn detected(answer: Answer, lookup: &impl Fn(&str) -> Option<String>) -> ProtocolType {
+    if answer.kitty {
+        return ProtocolType::Kitty;
+    }
+    if answer.sixel {
+        return ProtocolType::Sixel;
+    }
+    // A protocol drawn at a guessed cell size spills past its slot.
+    if !answer.cell {
+        return ProtocolType::Halfblocks;
+    }
+    match protocol_by_name(lookup) {
+        // Kitty and Sixel answer for themselves; only iTerm2 images cannot.
+        Some(ProtocolType::Kitty | ProtocolType::Sixel) if answer.heard => ProtocolType::Halfblocks,
+        Some(protocol) => protocol,
+        None => ProtocolType::Halfblocks,
+    }
+}
+
+/// Whether pictures are drawn at all: a half-block is a background, which is
+/// dropped below truecolour, and a protocol's pixels are not.
+pub fn drawn(truecolour: bool, protocol: ProtocolType) -> bool {
+    truecolour || protocol != ProtocolType::Halfblocks
+}
+
+/// The protocol a terminal is known to draw, from its environment.
+fn protocol_by_name(lookup: &impl Fn(&str) -> Option<String>) -> Option<ProtocolType> {
+    use crate::colour::names;
+    let set = |key: &str| lookup(key).is_some_and(|value| !value.trim().is_empty());
+    let term = lookup("TERM").unwrap_or_default().to_ascii_lowercase();
+    let program = lookup("TERM_PROGRAM")
+        .map(|p| p.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if term.starts_with("tmux") || program == "tmux" {
+        // Only the hints that outlive the multiplexer: a kitty inside tmux is
+        // found by its answer, and its own variables go stale.
+        return (set("ITERM_SESSION_ID") || set("WEZTERM_EXECUTABLE"))
+            .then_some(ProtocolType::Iterm2);
+    }
+    if term.starts_with("screen") {
+        return None;
+    }
+    if program == "wezterm"
+        || program == "iterm.app"
+        || set("WEZTERM_EXECUTABLE")
+        || lookup("LC_TERMINAL").is_some_and(|t| t.contains("iTerm"))
+    {
+        return Some(ProtocolType::Iterm2);
+    }
+    if program == "ghostty"
+        || names(&term, "xterm-ghostty")
+        || names(&term, "xterm-kitty")
+        || set("KITTY_WINDOW_ID")
+    {
+        return Some(ProtocolType::Kitty);
+    }
+    // Inherited by whatever Windows Terminal starts, so only a bare one counts.
+    if names(&term, "foot") || (program.is_empty() && set("WT_SESSION")) {
+        return Some(ProtocolType::Sixel);
+    }
+    None
+}
+
 /// One picture to build.
 struct Job {
     key: Arc<Key>,
@@ -313,6 +443,31 @@ pub struct Pictures {
     jobs: mpsc::Sender<Job>,
     /// Each finished job, with `None` for one skipped.
     done: mpsc::Receiver<(Arc<Key>, Option<Built>)>,
+    /// Kitty images whose picture is gone, waiting to be deleted.
+    retired: Vec<u32>,
+    /// Whether a delete has to pass through tmux.
+    tmux: bool,
+    /// Where the picker goes, until it has been given.
+    picker: Option<mpsc::Sender<Picker>>,
+}
+
+/// A Kitty image id no other picture, nor another pane on the same terminal,
+/// is likely to hold. Never 0, which the protocol does not accept.
+fn kitty_id() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    static NEXT: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+    let next = NEXT.get_or_init(|| {
+        let seed = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        std::sync::atomic::AtomicU32::new(seed as u32)
+    });
+    loop {
+        let id = next.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
 }
 
 /// Pictures decoded since the process started, on any thread.
@@ -339,20 +494,34 @@ fn undecoded() -> Built {
         panels: Vec::new(),
         verdict: Verdict::Undecoded,
         profiles_differ: false,
+        kitty: Vec::new(),
     }
 }
 
 impl Pictures {
-    /// A cache whose worker builds in `inks` and calls `wake` after each picture.
-    pub fn new(inks: Inks, wake: Box<dyn Fn() + Send>) -> Self {
+    /// A cache whose worker builds in `inks`, encodes for `picker`, and calls
+    /// `wake` after each picture.
+    pub fn new(inks: Inks, picker: Picker, wake: Box<dyn Fn() + Send>) -> Self {
+        let mut pictures = Self::unpicked(inks, wake);
+        pictures.pick(picker);
+        pictures
+    }
+
+    /// A cache whose worker holds every job until [`Pictures::pick`] says how
+    /// to encode, so nothing is built twice.
+    pub fn unpicked(inks: Inks, wake: Box<dyn Fn() + Send>) -> Self {
         let (jobs, inbox) = mpsc::channel::<Job>();
         let (outbox, done) = mpsc::channel();
+        let (picked, picker) = mpsc::channel::<Picker>();
         let shown = Arc::new(Mutex::new(HashSet::new()));
         let still = Arc::clone(&shown);
         // Detached: it ends when the cache, and with it the sender, is dropped.
         let _ = std::thread::Builder::new()
             .name(WORKER.to_owned())
             .spawn(move || {
+                let Ok(picker) = picker.recv() else {
+                    return;
+                };
                 for job in inbox {
                     let wanted = still.lock().map_or(
                         true,
@@ -360,7 +529,7 @@ impl Pictures {
                             shown.contains(&job.key)
                         },
                     );
-                    let built = wanted.then(|| build(&job, inks));
+                    let built = wanted.then(|| build(&job, inks, &picker));
                     if outbox.send((job.key, built)).is_err() {
                         break;
                     }
@@ -373,7 +542,50 @@ impl Pictures {
             shown,
             jobs,
             done,
+            retired: Vec::new(),
+            tmux: false,
+            picker: Some(picked),
         }
+    }
+
+    /// Say how pictures are encoded, which starts the held jobs. Once only.
+    pub fn pick(&mut self, picker: Picker) {
+        if let Some(picked) = self.picker.take() {
+            self.tmux = picker.tmux_detected();
+            let _ = picked.send(picker);
+        }
+    }
+
+    /// Keep the pictures in `shown`, and retire the Kitty images of the rest.
+    fn keep(&mut self, shown: &HashSet<Arc<Key>>) {
+        let retired = &mut self.retired;
+        self.built.retain(|key, ready| {
+            let kept = shown.contains(key);
+            if !kept {
+                retired.extend(&ready.0.kitty);
+            }
+            kept
+        });
+    }
+
+    /// Retire every kept picture, for a pane about to leave the terminal.
+    pub fn retire_all(&mut self) {
+        self.keep(&HashSet::new());
+    }
+
+    /// The Kitty deletes owed since the last call, to write before the next
+    /// frame. Empty for any other protocol.
+    pub fn retired(&mut self) -> String {
+        use ratatui_image::picker::cap_parser::Parser;
+        let (start, escape, end) = Parser::tmux_start_escape_end(self.tmux);
+        let mut deletes = String::new();
+        for id in self.retired.drain(..) {
+            // `q=2`: an answer would reach the event reader as keys.
+            deletes.push_str(&format!(
+                "{start}{escape}_Ga=d,d=I,i={id},q=2{escape}\\{end}"
+            ));
+        }
+        deletes
     }
 
     /// Take in what the worker finished since the last call.
@@ -417,7 +629,7 @@ impl Pictures {
             }
         }
         let shown: HashSet<Arc<Key>> = hung.iter().map(|(key, _, _)| Arc::clone(key)).collect();
-        self.built.retain(|key, _| shown.contains(key));
+        self.keep(&shown);
         // Before any job is sent, or the worker can skip one as not on screen.
         if let Ok(mut on_screen) = self.shown.lock() {
             *on_screen = shown;
@@ -465,8 +677,9 @@ impl Pictures {
             let done = self.pending.is_empty();
             if done || std::time::Instant::now() >= until {
                 // A picture that left the screen while it was built is not kept.
-                if let Ok(shown) = self.shown.lock() {
-                    self.built.retain(|key, _| shown.contains(key));
+                let shared = Arc::clone(&self.shown);
+                if let Ok(shown) = shared.lock() {
+                    self.keep(&shown);
                 }
                 return done;
             }
@@ -569,24 +782,94 @@ enum Paint {
 }
 
 /// One panel: `image`, already shrunk to the slot's pixels, painted and encoded
-/// as half-blocks.
+/// for `picker`.
 fn panel(
     image: RgbImage,
-    hit: Option<&[bool]>,
+    hit: Option<&Hits>,
     slot: Slot,
     paint: Paint,
     inks: Inks,
-) -> Option<SlicedProtocol> {
-    let halfblocks = Halfblocks::new(
-        DynamicImage::ImageRgb8(painted(image, hit, paint, inks)),
-        Size::new(slot.width, slot.rows),
-    )
-    .ok()?;
-    Some(SlicedProtocol::Halfblocks(halfblocks))
+    picker: &Picker,
+) -> Option<(SlicedProtocol, Option<u32>)> {
+    let image = DynamicImage::ImageRgb8(painted(image, hit, paint, inks));
+    let size = Size::new(slot.width, slot.rows);
+    // Direct, because the picker's fit would read the grid as font pixels.
+    if picker.protocol_type() == ProtocolType::Halfblocks {
+        return Some((
+            SlicedProtocol::Halfblocks(Halfblocks::new(image, size).ok()?),
+            None,
+        ));
+    }
+    if picker.protocol_type() == ProtocolType::Kitty {
+        // Built here rather than by the picker, so the id is known for its delete.
+        let id = kitty_id();
+        let cells = ratatui_image::Resize::natural_size(&image, picker.font_size());
+        let kitty = ratatui_image::protocol::kitty::Kitty::new(
+            image,
+            cells,
+            id,
+            picker.tmux_detected(),
+            false,
+            false,
+        )
+        .ok()?;
+        return Some((SlicedProtocol::Kitty(kitty), Some(id)));
+    }
+    let sliced =
+        SlicedProtocol::new_with_resize(picker, image, size, ratatui_image::Resize::Fit(None))
+            .ok()?;
+    Some((sliced, None))
+}
+
+/// A slot's half-block grid: two pixels to a cell's height.
+fn grid_of(slot: Slot) -> (u32, u32) {
+    (u32::from(slot.width), u32::from(slot.rows) * 2)
+}
+
+/// The pixels a slot is drawn at: its half-block grid, or for a protocol the
+/// image fitted into the slot's real pixels. Fitted here rather than by the
+/// crate because the mask is painted at these pixels.
+fn pixels_of(slot: Slot, (width, height): (u32, u32), picker: &Picker) -> (u32, u32) {
+    if picker.protocol_type() == ProtocolType::Halfblocks {
+        return grid_of(slot);
+    }
+    let font = picker.font_size();
+    let room = (
+        u32::from(slot.width) * u32::from(font.width),
+        u32::from(slot.rows) * u32::from(font.height),
+    );
+    let scaled = |side: u32, to: u32, by: u32, cap: u32| {
+        ((u64::from(side) * u64::from(to) / u64::from(by)) as u32).clamp(1, cap)
+    };
+    // The side that binds is the room exactly, so the crate's own fit sees a
+    // whole number of cells and does not resize again.
+    if u64::from(room.0) * u64::from(height) <= u64::from(room.1) * u64::from(width) {
+        (room.0, scaled(height, room.0, width, room.1))
+    } else {
+        (scaled(width, room.1, height, room.0), room.1)
+    }
+}
+
+/// Which cells of a half-block grid `width` by `height` changed.
+struct Hits {
+    cells: Vec<bool>,
+    width: u32,
+    height: u32,
+}
+
+impl Hits {
+    /// Whether the pixel at `i` of an image `width` by `height` lies in a changed
+    /// cell, so a change is as wide on a protocol's pixels as on half-blocks.
+    fn at(&self, i: usize, (width, height): (u32, u32)) -> bool {
+        let (x, y) = (i as u32 % width, i as u32 / width);
+        let cell = (y * self.height / height) * self.width + x * self.width / width;
+        self.cells[cell as usize]
+    }
 }
 
 /// `image`'s pixels in `paint`, with `hit` marking the changed ones for a mask.
-fn painted(mut image: RgbImage, hit: Option<&[bool]>, paint: Paint, inks: Inks) -> RgbImage {
+fn painted(mut image: RgbImage, hit: Option<&Hits>, paint: Paint, inks: Inks) -> RgbImage {
+    let dimensions = image.dimensions();
     let (cr, cg, cb) = inks.canvas;
     let canvas = [cr, cg, cb].map(f32::from);
     // Toward the pane and away from it by lightness, hard enough that a light
@@ -601,7 +884,7 @@ fn painted(mut image: RgbImage, hit: Option<&[bool]>, paint: Paint, inks: Inks) 
         pixel.0 = match paint {
             Paint::Plain => pixel.0,
             Paint::Dim => [0, 1, 2].map(|c| (p[c] * 0.45 + canvas[c] * 0.55) as u8),
-            Paint::Mask if hit.is_some_and(|hit| hit[i]) => {
+            Paint::Mask if hit.is_some_and(|hit| hit.at(i, dimensions)) => {
                 let (r, g, b) = inks.changed;
                 [r, g, b]
             }
@@ -622,7 +905,7 @@ fn painted(mut image: RgbImage, hit: Option<&[bool]>, paint: Paint, inks: Inks) 
 
 /// Build one picture: read and decode both sides, compare them, and encode each
 /// panel. A side that does not decode builds nothing to draw.
-fn build(job: &Job, inks: Inks) -> Built {
+fn build(job: &Job, inks: Inks, picker: &Picker) -> Built {
     let side = |source: &Option<Source>, format: Option<Format>| match (source, format) {
         (Some(source), Some(format)) => decode(source, format).map(Some),
         (None, None) => Some(None),
@@ -657,6 +940,7 @@ fn build(job: &Job, inks: Inks) -> Built {
     // share one pass.
     let mut shrunk: HashMap<(Side, u32, u32), RgbImage> = HashMap::new();
     let mut panels = Vec::new();
+    let mut kitty = Vec::new();
     for (&slot, &(side, paint)) in job.key.shape.slots.iter().zip(job.key.shape.kind.paints()) {
         let image = match side {
             Side::Old => old.as_ref(),
@@ -665,7 +949,7 @@ fn build(job: &Job, inks: Inks) -> Built {
         let Some(image) = image else {
             return undecoded();
         };
-        let to = (u32::from(slot.width), u32::from(slot.rows) * 2);
+        let to = pixels_of(slot, image.dimensions(), picker);
         let small = shrunk
             .entry((side, to.0, to.1))
             .or_insert_with(|| {
@@ -681,18 +965,27 @@ fn build(job: &Job, inks: Inks) -> Built {
             })
             .clone();
         let hit = match (paint, &mask) {
-            (Paint::Mask, Some(mask)) => Some(shrink_mask(mask, image.dimensions(), to)),
+            (Paint::Mask, Some(mask)) => {
+                let grid = grid_of(slot);
+                Some(Hits {
+                    cells: shrink_mask(mask, image.dimensions(), grid),
+                    width: grid.0,
+                    height: grid.1,
+                })
+            }
             _ => None,
         };
-        let Some(protocol) = panel(small, hit.as_deref(), slot, paint, inks) else {
+        let Some((protocol, id)) = panel(small, hit.as_ref(), slot, paint, inks, picker) else {
             return undecoded();
         };
+        kitty.extend(id);
         panels.push((slot, protocol));
     }
     Built {
         panels,
         verdict,
         profiles_differ,
+        kitty,
     }
 }
 
@@ -862,7 +1155,12 @@ mod tests {
             dim.get_pixel(0, 0).0.iter().all(|c| *c < 200),
             "a deleted picture was not dimmed toward the pane"
         );
-        let mask = painted(image, Some(&[true, false]), Paint::Mask, inks);
+        let hits = Hits {
+            cells: vec![true, false],
+            width: 2,
+            height: 1,
+        };
+        let mask = painted(image, Some(&hits), Paint::Mask, inks);
         assert_eq!(
             mask.get_pixel(0, 0).0,
             [0xf8, 0x51, 0x49],
@@ -878,12 +1176,233 @@ mod tests {
         );
     }
 
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |key| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    /// The override then the answer, composed as `run` composes them.
+    fn chosen(
+        answer: Answer,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<ProtocolType, PicturesError> {
+        Ok(protocol_of(forced(&lookup)?, answer, &lookup))
+    }
+
+    const KNOWN: Answer = Answer {
+        kitty: false,
+        sixel: false,
+        cell: true,
+        heard: false,
+    };
+
+    #[test]
+    fn override_wins() {
+        let answer = Answer {
+            kitty: true,
+            ..KNOWN
+        };
+        for (value, want) in [
+            (" Sixel ", ProtocolType::Sixel),
+            ("halfblocks", ProtocolType::Halfblocks),
+            ("iterm2", ProtocolType::Iterm2),
+            ("KITTY", ProtocolType::Kitty),
+        ] {
+            assert_eq!(
+                chosen(answer, env(&[(PICTURES_VAR, value)])),
+                Ok(want),
+                "{PICTURES_VAR}={value:?}"
+            );
+        }
+        assert_eq!(
+            chosen(answer, env(&[(PICTURES_VAR, "auto")])),
+            Ok(ProtocolType::Kitty),
+            "auto did not fall through to the answer"
+        );
+        assert_eq!(
+            chosen(answer, env(&[(PICTURES_VAR, "  ")])),
+            Ok(ProtocolType::Kitty),
+            "a blank override was not taken as unset"
+        );
+    }
+
+    #[test]
+    fn override_refused() {
+        assert_eq!(
+            chosen(KNOWN, env(&[(PICTURES_VAR, "png")])),
+            Err(PicturesError {
+                value: "png".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn answer_wins() {
+        let wezterm = env(&[("TERM_PROGRAM", "WezTerm")]);
+        let kitty = Answer {
+            kitty: true,
+            sixel: true,
+            cell: true,
+            heard: true,
+        };
+        assert_eq!(chosen(kitty, &wezterm), Ok(ProtocolType::Kitty));
+        let sixel = Answer {
+            sixel: true,
+            ..KNOWN
+        };
+        assert_eq!(chosen(sixel, &wezterm), Ok(ProtocolType::Sixel));
+    }
+
+    #[test]
+    fn env_table() {
+        for (pairs, want) in [
+            (&[("TERM_PROGRAM", "WezTerm")][..], ProtocolType::Iterm2),
+            (&[("TERM_PROGRAM", "iTerm.app")], ProtocolType::Iterm2),
+            (&[("LC_TERMINAL", "iTerm2")], ProtocolType::Iterm2),
+            (&[("TERM_PROGRAM", "ghostty")], ProtocolType::Kitty),
+            (&[("TERM", "xterm-kitty")], ProtocolType::Kitty),
+            (&[("TERM", "foot")], ProtocolType::Sixel),
+            (&[("WT_SESSION", "abc")], ProtocolType::Sixel),
+            (
+                &[("TERM_PROGRAM", "WarpTerminal")],
+                ProtocolType::Halfblocks,
+            ),
+            (&[("TERM_PROGRAM", "vscode")], ProtocolType::Halfblocks),
+            (
+                &[("TERM_PROGRAM", "Apple_Terminal")],
+                ProtocolType::Halfblocks,
+            ),
+            (&[("TERM", "alacritty")], ProtocolType::Halfblocks),
+            (
+                &[("TERM", "screen-256color"), ("KITTY_WINDOW_ID", "1")],
+                ProtocolType::Halfblocks,
+            ),
+        ] {
+            assert_eq!(chosen(KNOWN, env(pairs)), Ok(want), "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn answer_denies_table() {
+        let heard = Answer {
+            heard: true,
+            ..KNOWN
+        };
+        assert_eq!(
+            chosen(heard, env(&[("WT_SESSION", "abc")])),
+            Ok(ProtocolType::Halfblocks),
+            "the table drew Sixel for a terminal that answered without it"
+        );
+        assert_eq!(
+            chosen(heard, env(&[("TERM_PROGRAM", "WezTerm")])),
+            Ok(ProtocolType::Iterm2),
+            "an answer hid iTerm2 images, which no terminal reports"
+        );
+        assert_eq!(
+            chosen(
+                KNOWN,
+                env(&[("WT_SESSION", "abc"), ("TERM_PROGRAM", "vscode")])
+            ),
+            Ok(ProtocolType::Halfblocks),
+            "an inherited WT_SESSION drew Sixel in VS Code"
+        );
+    }
+
+    #[test]
+    fn tmux_outer_hint() {
+        let stale_kitty = env(&[("TERM", "tmux-256color"), ("KITTY_WINDOW_ID", "3")]);
+        assert_eq!(
+            chosen(KNOWN, stale_kitty),
+            Ok(ProtocolType::Halfblocks),
+            "a kitty variable inside tmux was believed"
+        );
+        let iterm = env(&[("TERM_PROGRAM", "tmux"), ("ITERM_SESSION_ID", "w0")]);
+        assert_eq!(chosen(KNOWN, iterm), Ok(ProtocolType::Iterm2));
+    }
+
+    #[test]
+    fn unknown_cell_halfblocks() {
+        let unknown = Answer {
+            cell: false,
+            ..KNOWN
+        };
+        assert_eq!(
+            chosen(unknown, env(&[("TERM_PROGRAM", "WezTerm")])),
+            Ok(ProtocolType::Halfblocks),
+            "a protocol was picked with no cell size to fit it to"
+        );
+    }
+
+    #[test]
+    fn protocol_any_depth() {
+        assert!(drawn(true, ProtocolType::Halfblocks));
+        assert!(!drawn(false, ProtocolType::Halfblocks));
+        for protocol in [
+            ProtocolType::Kitty,
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+        ] {
+            assert!(
+                drawn(false, protocol),
+                "{protocol:?} was not drawn below truecolour"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_pixels() {
+        let mut picker = Picker::halfblocks();
+        let slot = Slot {
+            x: 0,
+            width: 10,
+            rows: 6,
+        };
+        assert_eq!(pixels_of(slot, (100, 200), &picker), (10, 12));
+        picker.set_protocol_type(ProtocolType::Kitty);
+        // 100x120 pixels of room at 10x20 cells; a 1:2 image is fitted by height.
+        assert_eq!(pixels_of(slot, (100, 200), &picker), (60, 120));
+        let tall = Slot { rows: 20, ..slot };
+        assert_eq!(
+            pixels_of(tall, (100, 300), &picker),
+            (100, 300),
+            "a width-bound panel was cut to its width in height"
+        );
+        assert_eq!(
+            pixels_of(slot, (4, 4), &picker),
+            (100, 100),
+            "a small image was not fitted up to its slot"
+        );
+    }
+
+    #[test]
+    fn hits_span_cells() {
+        let hits = Hits {
+            cells: vec![false, true, false, false],
+            width: 2,
+            height: 2,
+        };
+        let (width, height) = (20u32, 40u32);
+        let lit: Vec<(u32, u32)> = (0..width * height)
+            .filter(|i| hits.at(*i as usize, (width, height)))
+            .map(|i| (i % width, i / width))
+            .collect();
+        assert_eq!(lit.len(), 200, "one changed cell lit {} pixels", lit.len());
+        assert!(
+            lit.iter().all(|(x, y)| *x >= 10 && *y < 20),
+            "a lit pixel is outside its cell"
+        );
+    }
+
     #[test]
     fn suffix_words() {
         let built = |verdict, profiles_differ| Built {
             panels: Vec::new(),
             verdict,
             profiles_differ,
+            kitty: Vec::new(),
         };
         assert_eq!(
             built(
