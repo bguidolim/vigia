@@ -101,7 +101,11 @@ fn the_collected_view_carries_what_the_walk_hid() {
     let mut highlighter = Highlighter::eager();
     let history = History::new();
     let viewport = Viewport {
-        position: Position { file: 0, row: 0 },
+        position: Position {
+            file: 0,
+            row: 0,
+            under: 0,
+        },
         anchored: false,
         diff_rows: 20,
         width: 80,
@@ -113,6 +117,7 @@ fn the_collected_view_carries_what_the_walk_hid() {
         landing: false,
         single: false,
         pictures: false,
+        rise: None,
         highlight: false,
     };
 
