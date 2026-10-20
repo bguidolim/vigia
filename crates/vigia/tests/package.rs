@@ -3236,7 +3236,8 @@ fn dependencies_in_readme() {
     );
 }
 
-/// A ready run is never cancelled by the draft run a push made just before it.
+/// A ready run is never cancelled by the draft run a push made just before it,
+/// and a newer run on any ref, main included, cancels the older.
 #[test]
 fn ready_run_survives() {
     let ci = repo_file(".github/workflows/ci.yml");
@@ -3244,15 +3245,33 @@ fn ready_run_survives() {
         .lines()
         .find(|line| line.trim_start().starts_with("group:"))
         .expect("ci.yml has a concurrency group");
-    assert!(
-        group.contains("github.event.pull_request.draft"),
-        "the concurrency group is not keyed on the draft flag, so a push and the \
-         ready event cancel each other and the survivor can be the skipped run: {group}"
+    assert_eq!(
+        group.trim(),
+        "group: ci-${{ github.event_name }}-${{ github.ref }}-${{ github.event.pull_request.draft }}",
+        "the concurrency group changed: without the draft flag a push and the ready event \
+         cancel each other and the survivor can be the skipped run; without the event a \
+         dispatch and a push on main cancel each other; with the commit a burst of merges \
+         runs every one to the end"
     );
+    let concurrency = ci
+        .split_once("\nconcurrency:\n")
+        .map(|(_, rest)| rest.split("\n\n").next().unwrap_or_default())
+        .expect("ci.yml has a concurrency block");
     assert!(
-        group.contains("github.ref == 'refs/heads/main' && github.sha"),
-        "main's commits share a concurrency group, and a group keeps one pending \
-         run, so a burst of merges cancels the ones in the middle: {group}"
+        concurrency
+            .lines()
+            .any(|line| line.trim() == "cancel-in-progress: true"),
+        "a superseded run is left to finish:\n{concurrency}"
+    );
+    let complete = ci
+        .split_once("\n  ci-complete:\n")
+        .map(|(_, rest)| rest.split("\n\n").next().unwrap_or_default())
+        .expect("ci.yml declares the ci-complete job");
+    assert!(
+        complete.lines().any(|line| line.trim()
+            == "if: ${{ always() && !(cancelled() && github.event_name != 'pull_request') }}"),
+        "ci complete runs in a cancelled run on main, so every superseded merge marks its \
+         commit red:\n{complete}"
     );
 }
 
