@@ -1602,6 +1602,91 @@ fn ci_complete_judgement() {
     );
 }
 
+/// Drives `tests-ran.sh` over a fabricated `cargo test` log, and returns
+/// whether it passed and what it printed.
+#[cfg(unix)]
+fn tests_ran(case: &str, log: &str) -> (bool, String) {
+    let dir = std::env::temp_dir().join(format!("vigia-tests-ran-{}-{case}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the log directory");
+    let path = dir.join("run.log");
+    std::fs::write(&path, log).expect("write the log");
+    let script = repo_root().join(".github/scripts/tests-ran.sh");
+    let output = std::process::Command::new("sh")
+        .arg(&script)
+        .arg(&path)
+        .args(["watch", "lfs_"])
+        .output()
+        .unwrap_or_else(|e| panic!("run {}: {e}", script.display()));
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn tests_ran_judgement() {
+    let result = |passed: u32, failed: u32, ignored: u32| {
+        format!(
+            "test result: ok. {passed} passed; {failed} failed; {ignored} ignored; 0 measured; 3 filtered out; finished in 0.01s\n"
+        )
+    };
+    let one = |result: String| format!("running 1 test\n{result}");
+    let unselected = "filter 'lfs_' ran no test in target 'watch'";
+    // `None` passes, and a string is what the error has to say.
+    for (case, log, error) in [
+        ("one", one(result(1, 0, 0)), None),
+        ("failed", one(result(0, 1, 0)), None),
+        ("crashed", "running 1 test\n".to_owned(), None),
+        (
+            "two",
+            format!(
+                "running 0 tests\n{}{}",
+                result(0, 0, 0),
+                one(result(1, 0, 0))
+            ),
+            None,
+        ),
+        (
+            "none",
+            format!("running 0 tests\n{}", result(0, 0, 0)),
+            Some(unselected),
+        ),
+        ("ignored", one(result(0, 0, 1)), Some(unselected)),
+        (
+            "unbuilt",
+            "error: could not compile `vigia`\n".to_owned(),
+            Some("target 'watch' never ran its tests"),
+        ),
+    ] {
+        let (passed, printed) = tests_ran(case, &log);
+        assert_eq!(
+            passed,
+            error.is_none(),
+            "tests-ran.sh judged the {case} log wrong:\n{log}"
+        );
+        if let Some(error) = error {
+            assert!(
+                printed.contains(error),
+                "the {case} error does not say {error:?}: {printed}"
+            );
+        }
+    }
+    // Before the pass and fail branches, so it judges both.
+    let flake = repo_file(".github/workflows/flake-rate.yml");
+    let check = flake
+        .find("sh .github/scripts/tests-ran.sh \"failures/run-$i.log\" \"$IN_TARGET\" \"$IN_TEST\" || exit 1")
+        .expect("flake-rate.yml stopped failing a run that ran no test");
+    let branch = flake
+        .find("if \"$passed\"; then")
+        .expect("flake-rate.yml branches on the result");
+    assert!(
+        check < branch,
+        "flake-rate.yml checks that a test ran on one branch only"
+    );
+}
+
 /// Drives `change-class.sh` with a list of paths and returns its last line.
 #[cfg(unix)]
 fn change_class(paths: &str) -> String {
