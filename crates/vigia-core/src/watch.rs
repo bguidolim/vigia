@@ -1166,17 +1166,28 @@ mod tests {
             let _ = backend.watch(path, mode);
             Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch))
         });
-        assert!(
-            ticks_within(&mut watcher, arming()),
-            "the failure did not tick"
-        );
-        let notice = watcher.take_store_notice().expect("no notice");
+        // A tree event from setting the repository up can tick first; the
+        // failure's tick is the one that carries the notice.
+        let notice = loop {
+            assert!(
+                ticks_within(&mut watcher, arming()),
+                "the failure did not tick"
+            );
+            if let Some(notice) = watcher.take_store_notice() {
+                break notice;
+            }
+        };
         assert!(
             notice.starts_with("LFS images redraw on the next change")
                 && notice.ends_with("watch limit reached"),
             "{notice}"
         );
         assert_eq!(watcher.take_store_notice(), None, "the notice came twice");
+        // Any stray tree tick still due, so the quiet below is the store's.
+        let deadline = Instant::now() + arming();
+        while ticks_within(&mut watcher, Duration::from_millis(300)) {
+            assert!(Instant::now() < deadline, "the tree never went quiet");
+        }
 
         std::fs::write(store.join("objects").join("object"), "x\n").expect("write");
         assert!(
@@ -1262,6 +1273,13 @@ mod tests {
             before + 1,
             "a ticking arm was filtered"
         );
+        // The two arms asked for, at construction and by the ancestor message,
+        // finish on the arming thread; wait for both before the directories go.
+        let deadline = Instant::now() + arming();
+        while watcher.store_watched().len() < 2 {
+            assert!(Instant::now() < deadline, "the arms never finished");
+            let _ = ticks_within(&mut watcher, Duration::from_millis(50));
+        }
     }
 
     /// An I/O failure says its kind, not its message.
