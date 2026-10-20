@@ -3322,7 +3322,7 @@ fn dependencies_in_readme() {
 }
 
 /// A ready run is never cancelled by the draft run a push made just before it,
-/// and a newer run on any ref, main included, cancels the older.
+/// a pull request keeps only its newest run, and a running main run finishes.
 #[test]
 fn ready_run_survives() {
     let ci = repo_file(".github/workflows/ci.yml");
@@ -3345,18 +3345,10 @@ fn ready_run_survives() {
     assert!(
         concurrency
             .lines()
-            .any(|line| line.trim() == "cancel-in-progress: true"),
-        "a superseded run is left to finish:\n{concurrency}"
-    );
-    let complete = ci
-        .split_once("\n  ci-complete:\n")
-        .map(|(_, rest)| rest.split("\n\n").next().unwrap_or_default())
-        .expect("ci.yml declares the ci-complete job");
-    assert!(
-        complete.lines().any(|line| line.trim()
-            == "if: ${{ always() && !(cancelled() && github.event_name != 'pull_request') }}"),
-        "ci complete runs in a cancelled run on main, so every superseded merge marks its \
-         commit red:\n{complete}"
+            .any(|line| line.trim()
+                == "cancel-in-progress: ${{ github.event_name == 'pull_request' }}"),
+        "a superseded pull request run is left to finish, or a running main run is \
+         cancelled and marks its commit red:\n{concurrency}"
     );
 }
 
