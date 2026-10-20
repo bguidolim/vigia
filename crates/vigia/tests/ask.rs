@@ -194,6 +194,8 @@ fn asked(ask: Ask) -> String {
             piped: ask.piped,
             detached: ask.detached,
             quiet: false,
+            size: None,
+            locked: false,
         },
     )
 }

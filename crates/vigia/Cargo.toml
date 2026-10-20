@@ -12,11 +12,11 @@ authors.workspace = true
 keywords = ["git", "diff", "tui", "monitor", "terminal"]
 categories = ["command-line-utilities", "development-tools"]
 
-# `SPEC.md` section 9 counts thirty-five *files* here that read outside this
-# package: thirty-two reach `vigia-core/tests/support` by `#[path]`, and five read
+# `SPEC.md` section 9 counts thirty-six *files* here that read outside this
+# package: thirty-three reach `vigia-core/tests/support` by `#[path]`, and five read
 # repository documents through `CARGO_MANIFEST_DIR`, of which `soak.rs` and
-# `sheet.rs` are in both groups, which is what makes the total thirty-five rather
-# than thirty-seven. No destination is inside this directory, so a packaged copy
+# `sheet.rs` are in both groups, which is what makes the total thirty-six rather
+# than thirty-eight. No destination is inside this directory, so a packaged copy
 # carries a test suite that cannot compile.
 #
 # Excluding the tests is section 9's own resolution, and the direction is the
@@ -83,10 +83,11 @@ windows-sys.workspace = true
 # nobody typed is too, and SPEC.md section 6 puts terminal I/O outside
 # `vigia-core` entirely.
 [target.'cfg(unix)'.dependencies]
-# SPEC.md section 6 names rustix for one act: polling the tty for the OSC 11
-# background reply at startup (#325). Already in the graph beneath crossterm
-# and notify; declaring it makes the direct use deliberate.
-rustix = { version = "1", default-features = false, features = ["event", "std"] }
+# SPEC.md section 6 names rustix for two acts: polling the tty for the OSC 11
+# background reply at startup (#325), and the terminal writer's own descriptor,
+# opened by `ttyname` and polled for room. Already in the graph beneath
+# crossterm and notify; declaring it makes the direct use deliberate.
+rustix = { version = "1", default-features = false, features = ["alloc", "event", "fs", "std", "termios"] }
 signal-hook.workspace = true
 
 # The tests reach `vigia-core/tests/support` by `#[path]`, the way

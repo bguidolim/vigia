@@ -28,6 +28,11 @@ pub struct Script<'a> {
     pub detached: bool,
     /// The child's stderr goes nowhere, so the terminal shows stdout alone.
     pub quiet: bool,
+    /// The terminal's columns, rows, and width and height in pixels, or none.
+    pub size: Option<(u16, u16, u16, u16)>,
+    /// The terminal's device closed to every open by name, as another user's
+    /// is under `su`.
+    pub locked: bool,
 }
 
 /// Run `command` in a fresh terminal under `script`, wait for its `asked`
@@ -58,6 +63,21 @@ pub fn run(command: Command, script: Script<'_>) -> String {
 /// child exiting on a terminal waits for its output to drain.
 pub fn start(mut command: Command, script: &Script<'_>) -> (Reaped, File) {
     let (terminal, slave) = open();
+    if let Some((columns, rows, width, height)) = script.size {
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: width,
+            ws_ypixel: height,
+        };
+        // SAFETY: a valid descriptor and a valid winsize.
+        unsafe { libc::ioctl(terminal.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+    }
+    if script.locked {
+        // SAFETY: a descriptor this test owns.
+        let locked = unsafe { libc::fchmod(slave.as_raw_fd(), 0) };
+        assert_eq!(locked, 0, "lock the terminal");
+    }
     command
         .stdout(Stdio::from(slave.try_clone().expect("dup")))
         .stderr(if script.quiet {
@@ -84,6 +104,45 @@ pub fn start(mut command: Command, script: &Script<'_>) -> (Reaped, File) {
     let child = Reaped(command.spawn().expect("spawn the child"));
     drop(slave);
     (child, terminal)
+}
+
+/// Start `command` with its input and controlling terminal on one terminal and
+/// its output on another: the child, both masters, and its standard error.
+pub fn split(mut command: Command) -> (Reaped, File, File, std::process::ChildStderr) {
+    let (input, input_slave) = open();
+    let (output, output_slave) = open();
+    let size = libc::winsize {
+        ws_row: 40,
+        ws_col: 100,
+        ws_xpixel: 1000,
+        ws_ypixel: 800,
+    };
+    for master in [&input, &output] {
+        // SAFETY: descriptors this test owns, and a valid winsize. Closed on
+        // exec, or the child would hold the masters open and never see a hangup.
+        unsafe {
+            libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size);
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+    command
+        .stdin(Stdio::from(input_slave.try_clone().expect("dup")))
+        .stdout(Stdio::from(output_slave.try_clone().expect("dup")))
+        .stderr(Stdio::piped());
+    // SAFETY: only async-signal-safe calls between fork and exec. The
+    // controlling terminal is taken through stdin, the input's.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn the child");
+    let stderr = child.stderr.take().expect("piped");
+    drop((input_slave, output_slave));
+    (Reaped(child), input, output, stderr)
 }
 
 /// The child's `asked` line.
@@ -132,6 +191,24 @@ fn open() -> (File, OwnedFd) {
 pub struct Reaped(Child);
 
 impl Reaped {
+    /// The child's process id.
+    pub fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// How the child ended, waiting up to `limit` without reading the
+    /// terminal, so a child that waits on its terminal is caught doing so.
+    pub fn exited_unread(&mut self, limit: Duration) -> Option<std::process::ExitStatus> {
+        let until = Instant::now() + ceiling(limit);
+        while Instant::now() < until {
+            if let Ok(Some(status)) = self.0.try_wait() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
     /// How the child ended, waiting up to `limit` and reading `master` into
     /// `seen` meanwhile: a child exiting on a terminal waits for its output to
     /// be read.
