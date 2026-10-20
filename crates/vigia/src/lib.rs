@@ -647,8 +647,8 @@ pub fn run(path: &Path) -> Result<(), Failure> {
                     }
                     // What the pointer is over, before anything asks what it meant.
                     shell.hovered = hover_after(&event, regions, shell.hovered);
-                    // The mode: while the reader's hand is in the box every key is the
-                    // box's and a press anywhere else closes it, and only what the box
+                    // The mode: while the reader's hand is in the box every key but
+                    // `Ctrl+L` is the box's and a press anywhere else closes it, and only what the box
                     // does not answer reaches the map below.
                     if shell.app.box_open() {
                         match notes::box_route(&event, shell.box_area()) {
@@ -1377,7 +1377,13 @@ impl Shell {
             self.noting = None;
             return Ok(true);
         }
-        if action != Action::Redraw {
+        if action == Action::Refresh {
+            self.pictures.refresh();
+            if let Err(e) = self.session.screen().clear() {
+                self.app.warn(format!("redraw: {e}"));
+            }
+        }
+        if !matches!(action, Action::Redraw | Action::Refresh) {
             self.deselect();
             self.noting = None;
         }
@@ -2567,6 +2573,19 @@ mod tests {
     }
 
     #[test]
+    fn refresh_clears_and_resends() {
+        // `Shell` holds a terminal, so the route is read rather than driven.
+        let source = include_str!("lib.rs");
+        let shipped = source.split("#[cfg(test)]").next().expect("split");
+        assert!(
+            shipped.contains(
+                "if action == Action::Refresh {\n            self.pictures.refresh();\n            if let Err(e) = self.session.screen().clear() {\n                self.app.warn(format!(\"redraw: {e}\"));\n            }"
+            ),
+            "`Ctrl+L` no longer retires the Kitty pictures and clears the screen"
+        );
+    }
+
+    #[test]
     fn the_wash_is_dropped_on_every_route_that_ends_it() {
         // `Shell` is private and holds a terminal, so its rules are read here rather
         // than driven. Each of these was a defect: a span the collect resolved to
@@ -2580,7 +2599,7 @@ mod tests {
             "self.app.select(None);",
             // Neither is reachable from a test, and both shipped once.
             "if action == Action::Escape && (self.selected.is_some() || self.noting.is_some()) {",
-            "if action != Action::Redraw {",
+            "if !matches!(action, Action::Redraw | Action::Refresh) {",
             "if chrome.selected.is_none() {",
             // A note drag ends the same way when the layout moves under it.
             "chrome.noting = repainted(chrome.noting, was, painted);",
