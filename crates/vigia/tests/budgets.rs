@@ -3367,37 +3367,57 @@ fn pdf_stream_bound() {
     let pane = Rect::new(0, 0, 120, 40);
     let mut app = App::new();
     app.draw_pictures(true);
-    let mut pictures = Pictures::new(
-        Inks {
-            canvas: (0x0d, 0x11, 0x17),
-            changed: (0xf8, 0x51, 0x49),
-        },
-        ratatui_image::picker::Picker::halfblocks(),
-        Box::new(|| {}),
-    );
     let layout = layout_of(&app, pane, frame.files().len());
     let history = History::new();
     let mut highlighter = Highlighter::eager();
-    let mut view = app
+    let view = app
         .view(&mut frame, &mut highlighter, &history, layout)
         .expect("view");
     if !absolute_gates_apply("cargo test --release -p vigia --test budgets") {
         return;
     }
     let _timed = exclusively_timed();
-    let began = Instant::now();
-    pictures.attach(&mut view.rows, &frame);
-    assert!(
-        pictures.settle(support::ceiling(Duration::from_secs(60))),
-        "the picture was not built"
-    );
-    let took = began.elapsed();
-    eprintln!("note: a page of 20 MB of content built in {took:?}, off the paint");
-    assert!(
-        took < budget(Duration::from_millis(600)),
-        "the worker took {took:?} for a page of 20 MB of content"
+    // Each in a cache of its own, so each builds the page from nothing.
+    let build = || {
+        let mut pictures = Pictures::new(
+            Inks {
+                canvas: (0x0d, 0x11, 0x17),
+                changed: (0xf8, 0x51, 0x49),
+            },
+            ratatui_image::picker::Picker::halfblocks(),
+            Box::new(|| {}),
+        );
+        let mut rows = view.rows.clone();
+        let began = Instant::now();
+        pictures.attach(&mut rows, &frame);
+        assert!(
+            pictures.settle(support::ceiling(Duration::from_secs(60))),
+            "the picture was not built"
+        );
+        began.elapsed()
+    };
+    let round = || {
+        let mut builds = Samples::new(PDF_STREAM_BUILDS);
+        for _ in 0..PDF_STREAM_BUILDS {
+            builds.push(build());
+        }
+        builds
+    };
+    let first = round();
+    // The build runs on the worker, which this thread's CPU clock cannot see,
+    // so a breach is retried once and never attributed.
+    holds_p99_rounds(
+        "the worker builds a page of 20 MB of content within its bound",
+        budget(Duration::from_millis(600)),
+        &first,
+        String::new,
+        || (round(), None),
     );
 }
+
+/// Builds of the 20 MB page timed per round.
+#[cfg(feature = "pdf")]
+const PDF_STREAM_BUILDS: usize = 3;
 
 /// A PDF of about 16 MiB, the most the frame path reads: an image's worth of
 /// bytes it skips, and a content stream that inflates to 15 MiB, which it
@@ -3436,6 +3456,10 @@ fn heaviest_pdf(seed: u8) -> Vec<u8> {
 #[test]
 fn pdf_frame_read() {
     use vigia::pictures::{Inks, Pictures};
+
+    // From the start: writing 80 MiB of PDFs is the heaviest fixture here, and
+    // it must not run beside another gate's timed region.
+    let _timed = exclusively_timed();
 
     let scratch = Scratch::new("i9-pdf-read");
     for n in 0..5 {
@@ -3483,32 +3507,60 @@ fn pdf_frame_read() {
         render(&mut buf, pane, &view, &theme, Glyphs::default(), &chrome);
         view
     };
-    let cold = Instant::now();
-    let view = paint(&mut frame, &mut app, &mut highlighter);
-    let cold = cold.elapsed();
-    let sized = view
-        .rows
-        .iter()
-        .filter(|row| matches!(row, Row::Sized { .. }))
-        .count();
+    // The first paint a reader sees, cold, in a pane of its own.
+    let (sized, read, cold_wall, cold_cpu) = pdf_cold_paint(&scratch, pane);
     assert_eq!(
         sized, 5,
         "not every PDF drew a size line, so this would time less"
     );
-    eprintln!("note: the first frame with {sized} changed 16 MiB PDFs on screen took {cold:?}");
-    // Read once more when they settle, as every file read inside the margin is.
-    settle(&mut frame);
-
+    eprintln!(
+        "note: the first frame with {sized} changed 16 MiB PDFs on screen took {cold_cpu:?} \
+         of thread CPU, {cold_wall:?} on the wall, and read {read} bytes"
+    );
+    // What the CPU gate cannot see: a frame that waited on reading them whole.
+    assert!(
+        read < 1024 * 1024,
+        "the first frame read {read} bytes of five 16 MiB PDFs, more than their headers"
+    );
     if !absolute_gates_apply("cargo test --release -p vigia --test budgets") {
         return;
     }
     // Each is sized on the worker, so the frame that first sees them reads
-    // only their headers.
+    // only their headers. Gated on thread CPU: a fresh runner's disk and
+    // scanner can hold the wall clock on files written a moment ago.
     assert!(
-        cold < budget(I9_FRAME),
-        "I9: the first frame with five changed 16 MiB PDFs on screen took {cold:?}"
+        cold_cpu < budget(I9_FRAME),
+        "I9: the first frame with five changed 16 MiB PDFs on screen took {cold_cpu:?} \
+         of thread CPU ({cold_wall:?} on the wall)"
     );
-    let _timed = exclusively_timed();
+    let mut cold = || {
+        let (sized, read, wall, cpu) = pdf_cold_paint(&scratch, pane);
+        assert_eq!(
+            sized, 5,
+            "a fresh pane drew {sized} of five PDFs, so it would time less"
+        );
+        assert!(
+            read < 1024 * 1024,
+            "a fresh pane read {read} bytes of five PDFs"
+        );
+        (wall, cpu)
+    };
+    let mut colds = Samples::new(COLD_PDF_FRAMES);
+    for _ in 0..COLD_PDF_FRAMES {
+        colds.push(cold().0);
+    }
+    holds_p99(
+        "I9: the first frame of a fresh pane with five changed 16 MiB PDFs on screen",
+        budget(I9_FRAME),
+        &colds,
+        String::new,
+        &mut cold,
+    );
+    // The long-lived pane only now, so its worker's builds run beside none of
+    // the cold samples.
+    paint(&mut frame, &mut app, &mut highlighter);
+    // Read once more when they settle, as every file read inside the margin is.
+    settle(&mut frame);
     let mut timed = |frame: &mut Frame, app: &mut App, highlighter: &mut Highlighter| {
         time_cpu(|| {
             paint(frame, app, highlighter);
@@ -3533,6 +3585,80 @@ fn pdf_frame_read() {
         || format!("({sized} PDFs sized on screen)"),
         || timed(&mut frame, &mut app, &mut highlighter),
     );
+}
+
+/// Cold frames timed after the first, each in a pane of its own.
+#[cfg(feature = "pdf")]
+const COLD_PDF_FRAMES: usize = 20;
+
+/// The first frame of a fresh pane over `scratch`'s changed PDFs: how many drew
+/// a size line, the bytes it read, and its wall and thread CPU time.
+#[cfg(feature = "pdf")]
+fn pdf_cold_paint(scratch: &Scratch, pane: Rect) -> (usize, u64, Duration, Duration) {
+    use vigia::pictures::{Inks, Pictures};
+
+    let worktree = scratch.worktree();
+    let mut frame = worktree.frame();
+    frame.advance().expect("advance");
+    let mut app = App::new();
+    app.draw_pictures(true);
+    let mut highlighter = Highlighter::eager();
+    let history = History::new();
+    let mut buf = Buffer::empty(pane);
+    let mut pictures = Pictures::new(
+        Inks {
+            canvas: (0x0d, 0x11, 0x17),
+            changed: (0xf8, 0x51, 0x49),
+        },
+        ratatui_image::picker::Picker::halfblocks(),
+        Box::new(|| {}),
+    );
+    let screen_layout = layout_of(&app, pane, frame.files().len());
+    let chrome = app.chrome(
+        "fixture",
+        None,
+        vigia::Stood {
+            standing: &Standing::Current,
+            now: 0,
+        },
+        Pointing::default(),
+        Default::default(),
+        "",
+    );
+    let (view, wall, cpu) = timed_cpu(|| {
+        let mut view = app
+            .view(&mut frame, &mut highlighter, &history, screen_layout)
+            .expect("view");
+        pictures.attach(&mut view.rows, &frame);
+        render(
+            &mut buf,
+            pane,
+            &view,
+            &Theme::dark(),
+            Glyphs::default(),
+            &chrome,
+        );
+        view
+    });
+    let sized = view
+        .rows
+        .iter()
+        .filter(|row| matches!(row, Row::Sized { .. }))
+        .count();
+    // Nothing on screen, so the worker skips what it has queued; its job in
+    // flight finishes here rather than beside the next timed frame.
+    pictures.attach(&mut [], &frame);
+    assert!(
+        pictures.settle(support::ceiling(Duration::from_secs(60))),
+        "a fresh pane's worker did not finish"
+    );
+    let stats = frame.stats();
+    (
+        sized,
+        stats.bytes + stats.measured_bytes + stats.paired_bytes,
+        wall,
+        cpu,
+    )
 }
 
 fn pictures_frame_of(protocol: ProtocolType, path: &str, old: Vec<u8>, new: Vec<u8>) {
