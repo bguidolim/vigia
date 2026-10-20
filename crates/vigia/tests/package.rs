@@ -1187,7 +1187,9 @@ fn the_push_that_moves_main_is_authorised_before_the_version_does() {
     // the assertion.
     let dispatch = hand_off_dispatch(&bump);
     assert!(
-        dispatch.contains(r#"= "true" ]; then tag=dry-run"#),
+        dispatch.contains(r#"if [ "${IN_REHEARSE}" = "true" ]; then tag=dry-run"#)
+            && step_block(&bump, "hand off to the release")
+                .contains("IN_REHEARSE: ${{ inputs.rehearse }}"),
         "the rehearsal's tag no longer depends on `rehearse` being true in the \
          way this gate can read. A flipped comparison here publishes for real \
          on every rehearsal: {dispatch}"
@@ -1858,12 +1860,14 @@ fn the_ci_workflow_runs_the_script_the_gate_proves() {
     // the shape production actually sends, which is where it broke: on a push
     // the expression below expands to nothing at all.
     assert!(
-        ci.contains("github.event.pull_request.draft }}'"),
+        ci.contains("PR_DRAFT: ${{ github.event.pull_request.draft }}")
+            && ci.contains("\"$PR_DRAFT\" \\"),
         "ci.yml does not pass the draft expression to the script, so the gate's draft \
          cases are testing an argument production never sends"
     );
     assert!(
-        ci.contains("'${{ needs.changes.outputs.class }}'"),
+        ci.contains("CHANGES_CLASS: ${{ needs.changes.outputs.class }}")
+            && ci.contains("\"$CHANGES_CLASS\" \\"),
         "ci.yml does not pass the class to the script, so a docs pull request's skips          and a broken classifier's skips are judged alike"
     );
     for leg in [
@@ -1872,12 +1876,15 @@ fn the_ci_workflow_runs_the_script_the_gate_proves() {
         "budgets",
         "benches",
         "pure-rust",
+        "zizmor",
         "musl",
         "docs",
     ] {
-        let arg = format!("'{leg}=${{{{ needs.{leg}.result }}}}'");
+        let var = format!("NEEDS_{}_RESULT", leg.to_uppercase().replace('-', "_"));
+        let arg = format!("\"{leg}=${{{var}}}\"");
+        let bound = format!("{var}: ${{{{ needs.{leg}.result }}}}");
         assert!(
-            ci.contains(&arg),
+            ci.contains(&arg) && ci.contains(&bound),
             "ci.yml does not pass {arg} to the script, so that leg is judged by nothing"
         );
     }
@@ -1906,7 +1913,8 @@ fn the_bump_workflow_runs_the_script_the_gate_proves() {
     let bump = without_comments(&repo_file(".github/workflows/bump.yml"));
     let step = step_block(&bump, "raise the version");
     assert!(
-        step.contains("sh .github/scripts/raise-version.sh '${{ steps.version.outputs.next }}'"),
+        step.contains("NEXT: ${{ steps.version.outputs.next }}")
+            && step.contains("sh .github/scripts/raise-version.sh \"$NEXT\""),
         "bump.yml's raise step does not run raise-version.sh with the computed version, \
          so the gate over the script proves nothing about the release: {step}"
     );
@@ -3798,7 +3806,8 @@ fn deny_policy() {
         "ci.yml does not run the full dependency check"
     );
     assert!(
-        ci.contains("'deny=${{ needs.deny.result }}'")
+        ci.contains("\"deny=${NEEDS_DENY_RESULT}\"")
+            && ci.contains("NEEDS_DENY_RESULT: ${{ needs.deny.result }}")
             && jobs_of(&ci)
                 .iter()
                 .any(|(job, block)| job == "ci-complete" && block.contains(" deny,")),
@@ -3808,5 +3817,198 @@ fn deny_policy() {
     assert!(
         weekly.contains("cargo deny check advisories") && weekly.contains("schedule:"),
         "main is not checked for new advisories on a schedule"
+    );
+}
+
+/// The `uses:` lines in `workflow` that name an action by anything but a full
+/// commit or a local path.
+fn unpinned_uses(workflow: &str) -> Vec<String> {
+    without_comments(workflow)
+        .lines()
+        .filter_map(|line| {
+            line.trim_start()
+                .trim_start_matches("- ")
+                .strip_prefix("uses:")
+        })
+        .map(str::trim)
+        .filter(|target| {
+            if target.starts_with("./") {
+                return false;
+            }
+            let Some((_, rev)) = target.split_once('@') else {
+                return true;
+            };
+            !(rev.len() == 40 && rev.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every workflow names its actions by commit, so a moved tag cannot change
+/// what runs.
+#[test]
+fn actions_pinned() {
+    let fixture = "      - uses: actions/checkout@v6\n      - uses: a/b@0123456789abcdef0123456789abcdef01234567 # v1\n      - uses: ./.github/workflows/x.yml\n";
+    assert_eq!(
+        unpinned_uses(fixture),
+        ["actions/checkout@v6"],
+        "the scan missed a tag"
+    );
+    let dir = repo_root().join(".github/workflows");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("the workflows") {
+        let path = entry.expect("an entry").path();
+        if path.extension().is_none_or(|ext| ext != "yml") {
+            continue;
+        }
+        let text = read(&path);
+        assert_eq!(
+            unpinned_uses(&text),
+            Vec::<String>::new(),
+            "{} names actions by tag",
+            path.display()
+        );
+        checked += text.matches("uses:").count();
+    }
+    assert!(
+        checked >= 50,
+        "only {checked} uses: lines found, so the scan read nothing"
+    );
+    // A pinned rust-toolchain has no ref name to read the toolchain from.
+    for entry in std::fs::read_dir(&dir).expect("the workflows") {
+        let path = entry.expect("an entry").path();
+        let text = without_comments(&read(&path));
+        for (at, _) in text.match_indices("uses: dtolnay/rust-toolchain@") {
+            let after: Vec<&str> = text[at..].lines().skip(1).take(3).collect();
+            assert!(
+                after.iter().any(|line| line.contains("toolchain:")),
+                "{}: a pinned rust-toolchain names no toolchain",
+                path.display()
+            );
+        }
+    }
+    let ci = without_comments(&repo_file(".github/workflows/ci.yml"));
+    assert!(
+        ci.contains("zizmor --offline --config .github/zizmor.yml .github/workflows")
+            && ci.contains("\"zizmor=${NEEDS_ZIZMOR_RESULT}\""),
+        "ci complete does not judge the workflow audit"
+    );
+}
+
+/// The actions `seen` at more than one commit.
+fn split_actions(
+    seen: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) -> Vec<String> {
+    seen.iter()
+        .filter(|(_, revs)| revs.len() > 1)
+        .map(|(action, _)| action.clone())
+        .collect()
+}
+
+/// Each action runs at one commit everywhere: every workflow, and the commits
+/// dist pins `release.yml` to.
+#[test]
+fn actions_one_version() {
+    let mut seen: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(repo_root().join(".github/workflows")).expect("the workflows") {
+        let path = entry.expect("an entry").path();
+        for line in without_comments(&read(&path)).lines() {
+            let Some(target) = line
+                .trim_start()
+                .trim_start_matches("- ")
+                .strip_prefix("uses:")
+            else {
+                continue;
+            };
+            if let Some((action, rev)) = target.trim().split_once('@') {
+                seen.entry(action.to_owned())
+                    .or_default()
+                    .insert(rev.to_owned());
+            }
+        }
+    }
+    let manifest = repo_file("Cargo.toml");
+    let pins = manifest
+        .lines()
+        .find(|line| line.starts_with("github-action-commits = {"))
+        .expect("dist pins the release workflow's actions");
+    for pair in pins
+        .split(['{', '}', ','])
+        .filter(|part| part.contains('='))
+    {
+        let (action, rev) = pair.split_once('=').expect("a pair");
+        let (action, rev) = (
+            action.trim().trim_matches('"'),
+            rev.trim().trim_matches('"'),
+        );
+        if action == "github-action-commits" {
+            continue;
+        }
+        seen.entry(action.to_owned())
+            .or_default()
+            .insert(rev.to_owned());
+    }
+    assert_eq!(
+        split_actions(&seen),
+        Vec::<String>::new(),
+        "actions at more than one commit"
+    );
+    let mut fixture = std::collections::BTreeMap::new();
+    fixture.insert("a/b".to_owned(), ["1".to_owned(), "2".to_owned()].into());
+    fixture.insert("c/d".to_owned(), ["1".to_owned()].into());
+    assert_eq!(
+        split_actions(&fixture),
+        ["a/b"],
+        "the scan missed a split action"
+    );
+}
+
+/// The jobs in `workflow` that name no permissions of their own.
+fn jobs_without_permissions(workflow: &str) -> Vec<String> {
+    jobs_of(&without_comments(workflow))
+        .into_iter()
+        .filter(|(_, block)| {
+            !keys_at_indent(block, 4)
+                .iter()
+                .any(|key| key == "permissions")
+        })
+        .map(|(job, _)| job)
+        .collect()
+}
+
+/// Every workflow drops the token's default scopes, and every job names the
+/// scopes it uses. A file dist generated keeps dist's.
+#[test]
+fn permissions_declared() {
+    let mut checked = 0;
+    for entry in std::fs::read_dir(repo_root().join(".github/workflows")).expect("the workflows") {
+        let path = entry.expect("an entry").path();
+        let text = read(&path);
+        if text.starts_with("# This file was autogenerated by dist") {
+            continue;
+        }
+        let name = path.display();
+        assert!(
+            text.lines().any(|line| line == "permissions: {}"),
+            "{name} keeps the token's default scopes"
+        );
+        assert_eq!(
+            jobs_without_permissions(&text),
+            Vec::<String>::new(),
+            "{name} has jobs that declare no permissions"
+        );
+        checked += jobs_of(&without_comments(&text)).len();
+    }
+    assert!(
+        checked >= 15,
+        "only {checked} jobs found, so the scan read nothing"
+    );
+    let fixture =
+        "name: x\njobs:\n  a:\n    runs-on: x\n    permissions: {}\n  b:\n    runs-on: x\n";
+    assert_eq!(
+        jobs_without_permissions(fixture),
+        ["b"],
+        "the scan missed a job"
     );
 }
