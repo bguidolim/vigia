@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use ratatui_image::picker::Picker;
 use support::{Scratch, changes_sorted, noise, tail_changed};
 use vigia::pictures::{Inks, Pictures};
-use vigia_core::ChangeKind;
+use vigia_core::{ChangeKind, listing_walks};
 
 #[test]
 fn binary_rename_paired_by_worker() {
@@ -337,14 +337,15 @@ fn unlisted_pairs_listed_later() {
 fn full_scores_stop_listing() {
     // More unrelated pairs than the scores hold: the pane stops listing them
     // rather than evict one answer with the next, and goes quiet.
+    const SIDE: usize = 2_000;
     let scratch = Scratch::new("rename-full-scores");
     for n in 0..70u64 {
-        scratch.write(&format!("old/{n:02}.bin"), noise(400 + n, 2_000));
+        scratch.write(&format!("old/{n:02}.bin"), noise(400 + n, SIDE));
     }
     scratch.commit_all("initial");
     for n in 0..70u64 {
         std::fs::remove_file(scratch.path_of(&format!("old/{n:02}.bin"))).expect("remove");
-        scratch.write(&format!("new/{n:02}.bin"), noise(500 + n, 2_000));
+        scratch.write(&format!("new/{n:02}.bin"), noise(500 + n, SIDE));
     }
     let worktree = scratch.worktree();
     let mut frame = worktree.frame();
@@ -357,25 +358,49 @@ fn full_scores_stop_listing() {
         Picker::halfblocks(),
         Box::new(|| {}),
     );
+    // Counted, not timed: a slow runner only scores slowly, and a walk that
+    // re-arms itself is the only thing that raises the count.
+    let (side_walks_max, pair_walks_max) =
+        listing_walks(frame.files().len(), SIDE as u64).expect("sides small enough to bound");
     let (began, mut quiet, mut walks) = (Instant::now(), 0, 0);
+    let (mut side_walks, mut pair_walks) = (0, 0);
     while quiet < 100 {
         assert!(
-            began.elapsed() < Duration::from_secs(10),
-            "the pane still walks after 10s, {} walks",
+            began.elapsed() < Duration::from_mins(1),
+            "no quiet after a minute, {} walks",
             frame.stats().walks
         );
         let now = std::time::SystemTime::now();
         if let Some(wait) = frame.settles_in(now) {
             std::thread::sleep(wait);
+            let before = frame.stats();
             frame
                 .advance_if_settled(std::time::SystemTime::now())
                 .expect("advance");
+            let after = frame.stats();
+            if after.walks > before.walks {
+                assert!(
+                    after.side_reads > before.side_reads,
+                    "a walk to weigh sides read none"
+                );
+            }
+            side_walks += after.walks - before.walks;
         }
         pictures.score_pairs(&frame);
         std::thread::sleep(Duration::from_millis(2));
         let found = pictures.found_pairs();
-        pictures.pair(&mut frame, found).expect("pair");
-        quiet = if frame.stats().walks == walks {
+        assert!(
+            !found.iter().any(|&(_, score)| vigia_core::pairs(score)),
+            "noise paired, so the pair bound no longer holds"
+        );
+        let landed = !found.is_empty();
+        pair_walks += u64::from(pictures.pair(&mut frame, found).expect("pair"));
+        assert!(
+            side_walks <= side_walks_max && pair_walks <= pair_walks_max,
+            "{side_walks} walks to weigh sides (at most {side_walks_max}) and {pair_walks} to pair (at most {pair_walks_max})"
+        );
+        // Not quiet while a score is in flight, or a slow batch would end the loop early.
+        quiet = if frame.stats().walks == walks && !landed && pictures.pairs_waiting() == 0 {
             quiet + 1
         } else {
             0
