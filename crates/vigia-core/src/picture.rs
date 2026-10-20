@@ -403,6 +403,18 @@ pub(crate) fn lfs_oid(bytes: &[u8]) -> Option<&str> {
     (oid.len() == 64 && oid.bytes().all(|b| b.is_ascii_hexdigit())).then_some(oid)
 }
 
+/// The object an LFS pointer names, and the size it records.
+pub(crate) fn lfs_pointer(bytes: &[u8]) -> Option<(&str, u64)> {
+    let oid = lfs_oid(bytes)?;
+    let size = std::str::from_utf8(bytes)
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("size "))?
+        .parse()
+        .ok()?;
+    Some((oid, size))
+}
+
 /// The most each step of a header read may read, tried in order. A seek
 /// skips without reading, but it drops the reader's buffer, so each one costs a
 /// refill. `image`'s JPEG decoder reads to the end of what it is given, so the

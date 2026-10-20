@@ -247,9 +247,13 @@ impl Scene {
     }
 
     fn git(&self, args: &[&str]) {
+        // An installed git-lfs marks its driver required in the global
+        // config, and the bed's own commands must get past the missing one
+        // it names for the pane.
         let out = Command::new("git")
             .arg("-C")
             .arg(&self.dir)
+            .args(["-c", "filter.lfs.required=false"])
             .args(args)
             .output()
             .expect("run git");
@@ -329,6 +333,8 @@ impl Scene {
         let object = lfs_object();
         let (oid, pointer) = assets::lfs_pointer(&object, LFS_SEED);
         self.write("lfs/pointer.png", pointer);
+        let (_, unchanged) = assets::lfs_pointer(&assets::png(32, 32, 0x11), 0x11);
+        self.write("lfs/unchanged.png", unchanged);
         self.git(&["add", "-A"]);
         self.git(&["commit", "-q", "-m", "baseline"]);
         self.write(
@@ -341,13 +347,22 @@ impl Scene {
             &format!(".git/lfs/objects/{}/{}/{oid}", &oid[0..2], &oid[2..4]),
             object,
         );
-        // The index is refreshed after the clock has passed the commit, so no
-        // file reads as racily clean and status never asks the LFS filter
-        // (#659, whose fix removes this). Before the driver is named: git
-        // runs it for a racily clean file too, and this one cannot start.
-        std::thread::sleep(Duration::from_millis(1100));
-        self.git(&["update-index", "-q", "--refresh"]);
         self.git(&["config", "filter.lfs.process", "no-such-filter-process"]);
+        self.racy("lfs/unchanged.png");
+    }
+
+    /// Make `rela`'s index entry racily clean: the index gets the file's own
+    /// timestamp, so status must read the file again whatever the
+    /// filesystem's timestamp resolution.
+    fn racy(&self, rela: &str) {
+        let modified = std::fs::metadata(self.inside(rela))
+            .and_then(|meta| meta.modified())
+            .expect("read a scene file's timestamp");
+        std::fs::File::options()
+            .write(true)
+            .open(self.dir.join(".git/index"))
+            .and_then(|index| index.set_modified(modified))
+            .expect("set the index's timestamp");
     }
 
     /// Every change of `static`, written at once.
@@ -384,6 +399,9 @@ impl Scene {
         self.write("svg/icon.svg", assets::icon_svg(2));
         self.write("svg/label.svg", assets::labelled_svg("Load"));
         self.write("svg/costly.svg", assets::costly_svg());
+        // After the last index write: status must read it again and neither
+        // start the driver nor list it.
+        self.racy("lfs/unchanged.png");
     }
 
     /// The bursts of `replay`, each pause scaled by `pace`, with one line said
@@ -460,6 +478,20 @@ mod tests {
 
     fn cleaned() -> Cleaned {
         Cleaned(fresh_dir().expect("a scene directory"))
+    }
+
+    /// The unchanged LFS pointer's index entry is racily clean.
+    fn assert_racy(dir: &Path) {
+        let modified = |rela: &str| {
+            std::fs::metadata(dir.join(rela))
+                .and_then(|meta| meta.modified())
+                .expect("read a timestamp")
+        };
+        assert_eq!(
+            modified("lfs/unchanged.png"),
+            modified(".git/index"),
+            "the unchanged LFS pointer is not racily clean"
+        );
     }
 
     /// The static scene, built in a fresh directory.
@@ -726,6 +758,7 @@ mod tests {
     #[test]
     fn scene_renders() {
         let dir = built();
+        assert_racy(&dir);
         for (width, height) in [(120, 40), (80, 24)] {
             let found = draw_scene(&dir, width, height, false);
             let at = |path: &str| {
@@ -782,6 +815,10 @@ mod tests {
                     "{path} drew no picture at {width}x{height}"
                 );
             }
+            assert!(
+                !found.contains_key("lfs/unchanged.png"),
+                "an unchanged LFS pointer the walk read again was listed at {width}x{height}"
+            );
             // Old and new both drawn, so the old side came from the object.
             assert!(
                 matches!(sized("lfs/pointer.png").1, Kind::Three | Kind::Mask),
@@ -843,6 +880,7 @@ mod tests {
         let dir = cleaned();
         let scene = Scene::new(&dir);
         scene.baseline();
+        assert_racy(&dir);
         let mut said = Vec::new();
         scene.replay(0.0, |line| said.push(line.to_owned()));
         assert_eq!(said.last().map(String::as_str), Some("done"), "{said:?}");

@@ -43,6 +43,18 @@ pub(crate) struct Fingerprint {
     mtime: SystemTime,
 }
 
+impl Fingerprint {
+    /// The file's length.
+    pub(crate) fn len(self) -> u64 {
+        self.len
+    }
+
+    /// The file's modification time.
+    pub(crate) fn mtime(self) -> SystemTime {
+        self.mtime
+    }
+}
+
 /// Whether a config at `now` asks for a reload over the one loaded at `loaded`.
 /// Missing or empty is a writer between two steps, not a config.
 pub(crate) fn config_moved(now: Option<Fingerprint>, loaded: Option<Fingerprint>) -> bool {
@@ -61,11 +73,11 @@ struct Observed {
 
 /// How far in the past a modification time has to sit before it identifies the
 /// bytes that were read.
-const SETTLE_MARGIN: Duration = Duration::from_secs(2);
+pub(crate) const SETTLE_MARGIN: Duration = Duration::from_secs(2);
 
 /// Whether a modification time observed by a read starting at `read_started`
 /// identifies the bytes that read returned.
-fn settled(mtime: SystemTime, read_started: SystemTime) -> bool {
+pub(crate) fn settled(mtime: SystemTime, read_started: SystemTime) -> bool {
     // Subtraction rather than addition on purpose: adding the margin to `mtime`
     // needs an overflow arm no filesystem can reach, where a future modification
     // time is an `Err` and reachable.
@@ -423,9 +435,16 @@ impl<'w> Frame<'w> {
         let mut files = Vec::with_capacity(self.files.len());
         // Bound rather than consumed in place: what a walk hid is only knowable
         // once it has been drained.
+        // The clean filter is rebuilt by the walk's first read rather than kept for
+        // the life of the process, so a walk and the draw after it share one.
+        self.worktree.invalidate_filter();
         let mut walk = self.worktree.changes_at(&self.standing, options)?;
         for change in &mut walk {
             files.push(change?);
+        }
+        // An LFS file the walk could not decide yet is asked again when it can be.
+        if let Some(until) = self.worktree.lfs_wait() {
+            self.settles_at = Some(self.settles_at.map_or(until, |at| at.max(until)));
         }
         let mut hidden = walk.hidden();
         // Unstaged first, then staged, and the order is the product.
@@ -444,10 +463,6 @@ impl<'w> Frame<'w> {
 
         // Nothing above this line mutated the frame's picture of the worktree, which
         // is what makes a failed walk leave the previous frame intact.
-
-        // The clean filter is rebuilt by the next read rather than kept for the life of
-        // the process.
-        self.worktree.invalidate_filter();
 
         // And what was computed under the old rules goes with it.
         let taken_at = SystemTime::now();
@@ -1008,6 +1023,7 @@ mod tests {
             // These unit tests are over [`reusable`], which does not consult it:
             // the field decides how a file is *read*, and nothing here reads one.
             maybe_symlink: false,
+            mode_changed: false,
         }
     }
 
@@ -1020,6 +1036,7 @@ mod tests {
             before,
             after: after.map(Side::Blob),
             maybe_symlink: true,
+            mode_changed: false,
         }
     }
 
