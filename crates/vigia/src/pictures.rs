@@ -323,7 +323,7 @@ pub struct Inks {
 
 impl Inks {
     /// The pane's colour as the terminal said it is, or as dark or light as it
-    /// said, and the theme's removed bar.
+    /// said, and the theme's picture mask colour.
     pub fn of(theme: &crate::Theme, pane: Option<(u8, u8, u8)>, light: bool) -> Self {
         // Unanswered, the palette says which: a light one washes rows light.
         let washed_light = matches!(
@@ -335,10 +335,15 @@ impl Inks {
         } else {
             (0, 0, 0)
         });
-        let changed = match theme.removed_bar.bg {
-            Some(ratatui::style::Color::Rgb(r, g, b)) => (r, g, b),
-            _ => (0xf8, 0x51, 0x49),
+        // A pixel needs a real colour, so a named one falls through.
+        let rgb = |colour: Option<ratatui::style::Color>| match colour {
+            Some(ratatui::style::Color::Rgb(r, g, b)) => Some((r, g, b)),
+            _ => None,
         };
+        let changed = rgb(theme.picture_changed.bg)
+            .or_else(|| rgb(theme.picture_changed.fg))
+            .or_else(|| rgb(theme.removed_bar.bg))
+            .unwrap_or((0xf8, 0x51, 0x49));
         Self { canvas, changed }
     }
 }
@@ -2160,6 +2165,86 @@ mod tests {
             changed(&old, &new),
             [false],
             "a re-encoded transparent pixel counted"
+        );
+    }
+
+    #[test]
+    fn mask_ink_defaults() {
+        let changed = |theme: &crate::Theme| Inks::of(theme, None, false).changed;
+        let colours = crate::terminal::Colours {
+            background: (0x10, 0x10, 0x10),
+            foreground: None,
+            ansi: [Some((0xaa, 0x33, 0x33)); 16],
+        };
+        // Pinned by value, so a fallback that moved shows here.
+        for (name, theme, today) in [
+            ("ansi", crate::Theme::ansi(), (0xf8, 0x51, 0x49)),
+            ("dark", crate::Theme::dark(), (0xf8, 0x51, 0x49)),
+            ("light", crate::Theme::light(), (0xcf, 0x22, 0x2e)),
+            ("system", crate::Theme::system(None), (0xf8, 0x51, 0x49)),
+            (
+                "system answered",
+                crate::Theme::system(Some(&colours)),
+                (0xf8, 0x51, 0x49),
+            ),
+        ] {
+            assert_eq!(changed(&theme), today, "{name}'s mask changed colour");
+            for depth in [
+                crate::colour::Depth::Ansi256,
+                crate::colour::Depth::Ansi16,
+                crate::colour::Depth::None,
+            ] {
+                assert_eq!(
+                    changed(&theme.resolve(depth)),
+                    (0xf8, 0x51, 0x49),
+                    "{name}'s mask changed colour at {depth:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mask_ink_key() {
+        let changed = |source: &str| {
+            let theme = crate::theme::parse(source).expect("theme parses");
+            (Inks::of(&theme, None, false).changed, theme.removed_bar)
+        };
+        let dark = crate::Theme::dark().removed_bar;
+        assert_eq!(
+            changed("base = dark\npicture_changed = on #00ff00"),
+            ((0x00, 0xff, 0x00), dark),
+            "picture_changed did not move the mask alone"
+        );
+        assert_eq!(
+            changed("base = dark\nremoved_bar = on #123456").0,
+            (0x12, 0x34, 0x56),
+            "an unset picture_changed did not follow the theme's removed_bar"
+        );
+        assert_eq!(
+            changed("base = dark\nremoved_bar = on #123456\npicture_changed = on red").0,
+            (0x12, 0x34, 0x56),
+            "a named picture_changed hid the theme's removed_bar"
+        );
+        assert_eq!(
+            changed("base = dark\npicture_changed = #00ff00").0,
+            (0x00, 0xff, 0x00),
+            "a foreground picture_changed was ignored"
+        );
+        let resolved = crate::theme::parse("base = dark\npicture_changed = on #00ff00")
+            .expect("theme parses")
+            .resolve(crate::colour::Depth::Ansi256);
+        assert_eq!(
+            Inks::of(&resolved, None, false).changed,
+            (0x00, 0xff, 0x00),
+            "picture_changed was dropped below truecolour"
+        );
+        let foreground = crate::theme::parse("base = dark\npicture_changed = #00ff00")
+            .expect("theme parses")
+            .resolve(crate::colour::Depth::None);
+        assert_eq!(
+            Inks::of(&foreground, None, false).changed,
+            (0x00, 0xff, 0x00),
+            "a foreground picture_changed was dropped without colour"
         );
     }
 
