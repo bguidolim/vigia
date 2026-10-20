@@ -7527,3 +7527,50 @@ fn caret_weight_themed() {
         "the caret's row did not take the theme's colour"
     );
 }
+
+/// A file renamed and edited, as the list and the diff draw it, for
+/// `docs/READING.md`.
+#[test]
+fn rename_frame() {
+    let renamed = FileEntry {
+        from: Some("crates/vigia/src/main.rs".to_owned()),
+        kind: 'R',
+        ..entry("crates/vigia/src/shell.rs", 3, 1)
+    };
+    let mut view = one_file();
+    view.list_span = 1;
+    view.list = vec![renamed.clone().into()];
+    view.rows[0] = Row::file(renamed);
+    insta::assert_snapshot!(screen(100, 14, &view, &chrome()));
+}
+
+/// The pane as the README's "What you see" draws it: three files in the list,
+/// the newest one's diff below, and the status bar's readouts.
+#[test]
+fn glance_frame() {
+    let glance = glancing();
+    let scale = glance.scale;
+    let mut entries: Vec<FileEntry> = glance
+        .rows
+        .into_iter()
+        .filter_map(|row| match row {
+            Row::File(entry) => Some(*entry),
+            _ => None,
+        })
+        .collect();
+    // The newest file's counts and heat are the hunk drawn below it.
+    entries[0].churn = Some((3, 1));
+    entries[0].heat = heat(&[(9, 3, 1)]);
+    let mut view = one_file();
+    view.list_span = entries.len();
+    view.list = entries.iter().cloned().map(Into::into).collect();
+    view.rows[0] = Row::file(entries[0].clone());
+    view.scale = scale;
+    view.files = entries.len();
+    let chrome = Chrome {
+        frame: Some(Duration::from_micros(800)),
+        memory: Some(19 * 1024 * 1024),
+        ..chrome()
+    };
+    insta::assert_snapshot!(screen(80, 16, &view, &chrome));
+}

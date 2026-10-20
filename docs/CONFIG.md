@@ -153,7 +153,11 @@ set -ga terminal-features ",*:clipboard"
 
 ### 🪟 The pane you want, every time
 
-`f`, `r`, `s`, `o`, `a`, `w` and `c` change what the body is made of. Press `m` and flip them there, or say so once by hand:
+`f`, `r`, `s`, `o`, `a`, `w` and `c` change what the body is made of. Press `m` and flip them there:
+
+![The vigia pane with the config menu open over it: every on and off setting with where it stands, a row to save the settings and a row to reset them.](../assets/frame-menu.svg)
+
+Or say so once by hand:
 
 ```sh
 # ~/.config/vigia/config

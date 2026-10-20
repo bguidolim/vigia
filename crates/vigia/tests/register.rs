@@ -847,6 +847,17 @@ fn public_prose_denylist() {
             read(".github/PULL_REQUEST_TEMPLATE.md"),
         ),
     ];
+    // Every page under docs/, so a new one is covered without an edit here.
+    for entry in std::fs::read_dir(root.join("docs"))
+        .expect("read docs/")
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".md") {
+            let name = format!("docs/{name}");
+            files.push((name.clone(), read(&name)));
+        }
+    }
     let templates = root.join(".github/ISSUE_TEMPLATE");
     for entry in std::fs::read_dir(&templates)
         .unwrap_or_else(|e| panic!("read {}: {e}", templates.display()))

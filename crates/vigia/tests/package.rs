@@ -1356,20 +1356,20 @@ fn the_licence_each_crate_ships_is_the_repository_licence() {
     }
 }
 
-/// The grammar count the README states is the one the dump holds.
+/// The grammar count `docs/READING.md` states is the one the dump holds.
 #[test]
-fn the_readme_states_the_grammar_count_the_dump_holds() {
+fn grammar_count_documented() {
     let roster = repo_file("crates/vigia-core/assets/GRAMMARS.txt");
     let held = roster
         .lines()
         .filter(|line| !line.trim().is_empty())
         .count();
 
-    let readme = repo_file("README.md");
+    let reading = repo_file("docs/READING.md");
     let claim = format!("**{held} grammars**");
     assert!(
-        readme.contains(&claim),
-        "README.md does not say {claim:?}, and the dump holds {held} grammars. \
+        reading.contains(&claim),
+        "docs/READING.md does not say {claim:?}, and the dump holds {held} grammars. \
          Whichever moved, they have to move together"
     );
 }
@@ -1904,9 +1904,7 @@ fn docs_suites_named() {
                         && (DOCUMENTS.iter().any(|name| {
                             line.contains(&format!("\"{name}.md\""))
                                 || line.contains(&format!("/{name}.md\""))
-                        }) || line.contains("docs/THEME.md\"")
-                            || line.contains("docs/CONFIG.md\"")
-                            || line.contains("docs/TECHPACK.md\""))
+                        }) || (line.contains("\"docs/") && line.contains(".md\"")))
                 });
             if !reads {
                 continue;
@@ -2069,6 +2067,67 @@ fn the_changelog_names_the_version_the_manifest_carries() {
         date.len() == 10 && date.starts_with("20") && date.split('-').count() == 3,
         "the newest changelog heading dates the release {date:?}, which is not an \
          ISO date"
+    );
+}
+
+/// A version as three numbers, so `1.10.0` sorts after `1.9.0`.
+fn version_parts(version: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = version.split('.').map(str::parse);
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch)), None) => Some((major, minor, patch)),
+        _ => None,
+    }
+}
+
+/// No public page calls the manifest's version, or an older one, unreleased,
+/// and none pins the Rust or crate version an install needs.
+#[test]
+fn unreleased_marks() {
+    let manifest = repo_file("Cargo.toml");
+    let version = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("version = \""))
+        .and_then(|rest| rest.split('"').next())
+        .and_then(version_parts)
+        .expect("the workspace manifest carries a version");
+
+    let docs = repo_root().join("docs");
+    let mut pages = vec![("README.md".to_owned(), repo_file("README.md"))];
+    for entry in std::fs::read_dir(&docs)
+        .unwrap_or_else(|e| panic!("read {}: {e}", docs.display()))
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".md") {
+            pages.push((format!("docs/{name}"), read(&entry.path())));
+        }
+    }
+
+    let mut stale = Vec::new();
+    for (name, body) in &pages {
+        for (at, _) in body.match_indices(", unreleased)") {
+            let marked = body[..at]
+                .rsplit(' ')
+                .next()
+                .and_then(version_parts)
+                .unwrap_or_else(|| {
+                    panic!("{name} carries an unreleased mark with no version before it")
+                });
+            if marked <= version {
+                stale.push(format!("{name}: {marked:?}"));
+            }
+        }
+        for pin in ["img.shields.io/badge/rust-", "`cargo install vigia` ("] {
+            assert!(
+                !body.contains(pin),
+                "{name} pins a version with {pin:?}, which goes stale at the next release"
+            );
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "the manifest is at {version:?} and these pages still call it unreleased:\n{}",
+        stale.join("\n")
     );
 }
 
@@ -2816,8 +2875,8 @@ fn the_config_doc_teaches_a_config_file_that_parses_and_names_every_key() {
     );
 }
 
-/// Every gesture that a config key also reaches has a row in `README.md`'s key
-/// table.
+/// Every gesture that a config key also reaches has a row in `docs/KEYS.md`'s
+/// key table.
 ///
 /// The other half of the config block's gate, one vocabulary over: the block
 /// teaches what a reader *writes* and this table teaches what they *press*, and a
@@ -2825,11 +2884,11 @@ fn the_config_doc_teaches_a_config_file_that_parses_and_names_every_key() {
 /// The reverse direction belongs to `sheet.rs::every_gesture_the_readme_teaches_is_named_on_the_sheet`,
 /// since the table also teaches gestures no config key reaches.
 #[test]
-fn the_readme_key_table_names_every_gesture_a_config_key_reaches() {
-    let readme = repo_file("README.md");
+fn key_table_complete() {
+    let readme = repo_file("docs/KEYS.md");
 
     // The table follows a bold caption and a row's left cell is what a reader
-    // looks for. `sheet.rs::readme_gestures` reads both tables the same way;
+    // looks for. `sheet.rs::documented_gestures` reads both tables the same way;
     // only the keyboard one can carry a config key's gesture.
     //
     // The end is the first line that is neither blank nor a row, which is the
@@ -2860,7 +2919,7 @@ fn the_readme_key_table_names_every_gesture_a_config_key_reaches() {
     // below, and a change to the table's shape is exactly how that happens.
     assert!(
         taught.len() >= vigia::config::KEYS.len(),
-        "README.md's key table parsed to {} cells, so this gate is reading the \
+        "docs/KEYS.md's key table parsed to {} cells, so this gate is reading the \
          document's shape wrongly rather than reading its rows",
         taught.len()
     );
@@ -2875,7 +2934,7 @@ fn the_readme_key_table_names_every_gesture_a_config_key_reaches() {
         .collect();
     assert!(
         missing.is_empty(),
-        "the config file can set what {missing:?} press and README.md's key table \
+        "the config file can set what {missing:?} press and docs/KEYS.md's key table \
          never names them, so a reader can configure a gesture they cannot find"
     );
 }
@@ -2972,16 +3031,16 @@ fn a_resolve_holds_the_line_for_the_length_the_spec_gives_it() {
     );
 
     let told = phrase(
-        repo_file("README.md")
+        repo_file("docs/NOTES.md")
             .lines()
             .find(|line| line.contains("**When the agent resolves one**")),
         "holds for ",
         ",",
     )
-    .expect("README.md tells a reader how long the answer holds");
+    .expect("docs/NOTES.md tells a reader how long the answer holds");
     assert_eq!(
         told, held,
-        "README.md tells a reader the answer holds {told:?} and SPEC.md gives it \
+        "docs/NOTES.md tells a reader the answer holds {told:?} and SPEC.md gives it \
          {held:?}"
     );
 
@@ -3125,7 +3184,7 @@ fn lost_invariant_fails() {
     );
 }
 
-/// The upgrade the README teaches a Windows reader moves the binary aside.
+/// The upgrade `docs/INSTALL.md` teaches a Windows reader moves the binary aside.
 ///
 /// The assertion that matters is the absence. Stopping the servers frees the
 /// same path, so it reads like the obvious fix and was this defect's first
@@ -3135,11 +3194,8 @@ fn the_windows_upgrade_note_moves_the_binary_rather_than_stopping_it() {
     // Both ends bounded, and to the block rather than the file: stopping a hung
     // pane is fair advice elsewhere, and it is only the upgrade that must not
     // reach for it.
-    let block = repo_file("README.md")
-        .split_once("<summary><b>Upgrading on Windows")
-        .and_then(|(_, rest)| rest.split_once("</details>"))
-        .map(|(block, _)| block.to_owned())
-        .expect("README.md tells a Windows reader how to upgrade under an open session");
+    let install = repo_file("docs/INSTALL.md");
+    let block = section(&install, "\n## Upgrading on Windows");
 
     assert!(
         block.contains("Move-Item") && block.contains("vigia.exe"),
@@ -3165,7 +3221,7 @@ fn the_windows_upgrade_note_moves_the_binary_rather_than_stopping_it() {
 fn the_readme_names_what_the_pane_is_before_installation() {
     let readme = repo_file("README.md");
     let (above, _) = readme
-        .split_once("cargo install vigia")
+        .split_once("brew install")
         .expect("README.md no longer tells a reader how to install");
 
     for wanted in ["`?`", vigia::CONFIG_FILE] {
@@ -3197,8 +3253,9 @@ fn the_spec_quotes_the_sheets_purpose_lines() {
     );
 }
 
-/// Direct dependencies that `README.md`'s `Built with` table leaves out on purpose.
-const NOT_IN_README: [&str; 7] = [
+/// Direct dependencies that the `Built with` table in `docs/ARCHITECTURE.md`
+/// leaves out on purpose.
+const NOT_DOCUMENTED: [&str; 7] = [
     "libc",
     "rustix",
     "rustls-graviola",
@@ -3282,12 +3339,12 @@ fn dependencies_in_spec() {
     );
 }
 
-/// Every dependency but a dev one is in the README's `Built with` table or on
-/// [`NOT_IN_README`], and that list holds only dependencies absent from the table.
+/// Every dependency but a dev one is in the `Built with` table or on
+/// [`NOT_DOCUMENTED`], and that list holds only dependencies absent from the table.
 #[test]
-fn dependencies_in_readme() {
-    let readme = repo_file("README.md");
-    let table = section(&readme, "\n## 🧱 Built with");
+fn dependencies_documented() {
+    let architecture = repo_file("docs/ARCHITECTURE.md");
+    let table = section(&architecture, "# Built with");
     let in_table = |name: &str| {
         let link = format!("[{name}](");
         table
@@ -3303,21 +3360,21 @@ fn dependencies_in_readme() {
     let unplaced: Vec<&str> = shipped
         .iter()
         .copied()
-        .filter(|name| !in_table(name) && !NOT_IN_README.contains(name))
+        .filter(|name| !in_table(name) && !NOT_DOCUMENTED.contains(name))
         .collect();
     assert!(
         unplaced.is_empty(),
-        "{unplaced:?} is a direct dependency and README.md's `Built with` table \
-         neither names it nor is it on NOT_IN_README. Add a row, or add it to the list"
+        "{unplaced:?} is a direct dependency and docs/ARCHITECTURE.md's `Built with` table \
+         neither names it nor is it on NOT_DOCUMENTED. Add a row, or add it to the list"
     );
 
-    let stale: Vec<&str> = NOT_IN_README
+    let stale: Vec<&str> = NOT_DOCUMENTED
         .into_iter()
         .filter(|name| in_table(name) || !shipped.contains(name))
         .collect();
     assert!(
         stale.is_empty(),
-        "NOT_IN_README lists {stale:?}, which the table names or no manifest declares"
+        "NOT_DOCUMENTED lists {stale:?}, which the table names or no manifest declares"
     );
 }
 
@@ -4176,5 +4233,103 @@ fn release_attested() {
                 || !(block.contains("curl ") || block.contains("| sh") || block.contains("| iex")),
             "job `{job}` holds a signing scope and runs a fetched script"
         );
+    }
+}
+
+#[path = "../../../xtask/src/frames.rs"]
+#[allow(dead_code)]
+mod frames;
+
+/// Each frame picture under `assets/` is exactly what the generator draws from
+/// its snapshot today, every picture there is one the generator knows, and every
+/// docs page that shows one names it with its label. A failure is fixed by
+/// `cargo run -p xtask --bin frames`.
+#[test]
+fn frame_svgs_match() {
+    for frame in frames::FRAMES {
+        let snapshot = repo_file(&format!("{}/{}", frames::SNAPSHOTS, frame.snapshot));
+        let svg = repo_file(&format!("assets/{}", frame.file));
+        assert!(
+            svg == frames::draw(frame, &snapshot),
+            "{} is not what {} draws today; run `cargo run -p xtask --bin frames`",
+            frame.file,
+            frame.snapshot
+        );
+        // A label points at the row whose text it names, so a renderer change
+        // that moves a row cannot leave a label on the wrong one.
+        if !frame.labels.is_empty() {
+            let drawn = frames::drawn_rows(frame, &snapshot);
+            for label in frame.labels {
+                assert!(
+                    drawn
+                        .get(label.row)
+                        .is_some_and(|row| row.contains(label.marker)),
+                    "{}'s {} label points at a row without {:?}",
+                    frame.file,
+                    label.name,
+                    label.marker
+                );
+            }
+        }
+        if let Some(run) = frames::overflow(&svg) {
+            panic!("{} draws past its window: {run}", frame.file);
+        }
+        // XML forbids a double hyphen inside a comment, and a viewer then draws
+        // nothing at all.
+        for comment in svg.split("<!--").skip(1) {
+            let body = comment.split("-->").next().unwrap_or_default();
+            assert!(
+                !body.contains("--"),
+                "{} has a comment no XML parser accepts",
+                frame.file
+            );
+        }
+    }
+    let known: Vec<&str> = frames::FRAMES.iter().map(|frame| frame.file).collect();
+    for entry in std::fs::read_dir(repo_root().join("assets"))
+        .expect("read assets/")
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("frame-") {
+            assert!(
+                known.contains(&name.as_str()),
+                "assets/{name} is a frame the generator no longer draws"
+            );
+        }
+    }
+    // The README links by absolute URL, so crates.io can load it.
+    let mut pages: Vec<(std::path::PathBuf, &str)> = std::fs::read_dir(repo_root().join("docs"))
+        .expect("read docs/")
+        .flatten()
+        .map(|entry| (entry.path(), "../assets/"))
+        .collect();
+    pages.push((
+        repo_root().join("README.md"),
+        "https://raw.githubusercontent.com/breferrari/vigia/main/assets/",
+    ));
+    let readme = std::fs::read_to_string(repo_root().join("README.md")).expect("read README.md");
+    assert_eq!(
+        readme.matches("assets/frame-").count(),
+        readme
+            .matches("https://raw.githubusercontent.com/breferrari/vigia/main/assets/frame-")
+            .count(),
+        "README.md links a frame by a relative path, which crates.io cannot load"
+    );
+    for (path, prefix) in pages {
+        let page = std::fs::read_to_string(&path).unwrap_or_default();
+        for frame in frames::FRAMES {
+            let image = format!("({prefix}{})", frame.file);
+            for (at, _) in page.match_indices(&image) {
+                let alt = page[..at].rsplit("![").next().unwrap_or_default();
+                assert_eq!(
+                    alt.trim_end_matches(']'),
+                    frame.label,
+                    "{} shows {} with alt text that is not its label",
+                    path.display(),
+                    frame.file
+                );
+            }
+        }
     }
 }

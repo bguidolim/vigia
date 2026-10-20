@@ -890,12 +890,15 @@ fn names(keys: &str, token: &str) -> bool {
     })
 }
 
-/// The gestures `README.md`'s two tables teach, as the cells a reader meets there.
-fn readme_gestures() -> Vec<String> {
-    let readme = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
-    )
-    .expect("README.md is where the crate says it is");
+/// The gestures the key and mouse tables of `README.md` and `docs/KEYS.md`
+/// teach, as the cells a reader meets there.
+fn documented_gestures() -> Vec<String> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let readme = ["README.md", "docs/KEYS.md"]
+        .map(|name| {
+            std::fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"))
+        })
+        .join("\n");
 
     // Each table follows a bold caption. A row is `| cell | cell |`, and the left
     // cell is what a reader looks for.
@@ -933,7 +936,7 @@ fn readme_gestures() -> Vec<String> {
     }
     assert!(
         out.len() > 10,
-        "README.md's key and mouse tables parsed to {} rows, so this gate is \
+        "the key and mouse tables of README.md and docs/KEYS.md parsed to {} rows, so this gate is \
          reading the wrong thing and would pass over anything",
         out.len()
     );
@@ -961,7 +964,7 @@ fn every_gesture_the_readme_teaches_is_named_on_the_sheet() {
     }
     let drawn = rows.join("\n");
 
-    for cell in readme_gestures() {
+    for cell in documented_gestures() {
         // Every token of a cell on ONE drawn row, not each token anywhere on the sheet.
         let wanted: Vec<&str> = cell
             .split_whitespace()
@@ -1179,7 +1182,7 @@ fn bound_keys() -> Vec<(KeyEvent, String)> {
 /// `SPEC.md` while absent from the document a reader meets first.
 #[test]
 fn every_letter_the_map_binds_is_taught_by_the_readme() {
-    let taught: Vec<String> = readme_gestures()
+    let taught: Vec<String> = documented_gestures()
         .iter()
         .flat_map(|cell| {
             cell.split_whitespace()
@@ -3991,4 +3994,20 @@ fn ctrl_l_on_sheet_row() {
             at.height
         );
     }
+}
+
+/// The sheet's first page on a tall pane, for `docs/KEYS.md`.
+#[test]
+fn sheet_frame() {
+    let scratch = Scratch::large_diff("sheet-frame", FILES, 40);
+    let worktree = scratch.worktree();
+    let mut frame = worktree.frame();
+    materialise(&mut frame);
+    let mut app = App::new();
+    let mut highlighter = Highlighter::eager();
+    let history = History::new();
+    let at = Rect::new(0, 0, 100, 34);
+    toggle_at(&mut app, &mut frame, at);
+    let (buf, _) = paint(&mut app, &mut frame, &mut highlighter, &history, at);
+    insta::assert_snapshot!(text_of(&buf, at));
 }
