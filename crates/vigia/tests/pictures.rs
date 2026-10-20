@@ -91,7 +91,8 @@ impl Pane {
     fn settled(&mut self, frame: &mut Frame) -> View {
         self.view(frame);
         assert!(
-            self.pictures.settle(Duration::from_secs(60)),
+            self.pictures
+                .settle(support::ceiling(Duration::from_secs(60))),
             "the pictures were not built"
         );
         self.view(frame)
@@ -770,7 +771,7 @@ fn worker_skips_hidden() {
     let started = std::time::Instant::now();
     while pane.pictures.decodes() - decoded < 2 {
         assert!(
-            started.elapsed() < Duration::from_secs(60),
+            started.elapsed() < support::ceiling(Duration::from_secs(60)),
             "the first picture was never built"
         );
         std::thread::sleep(Duration::from_millis(5));
@@ -779,7 +780,8 @@ fn worker_skips_hidden() {
     pane.pictures.attach(&mut nothing, &frame);
     drop(release);
     assert!(
-        pane.pictures.settle(Duration::from_secs(60)),
+        pane.pictures
+            .settle(support::ceiling(Duration::from_secs(60))),
         "the worker never finished"
     );
 
