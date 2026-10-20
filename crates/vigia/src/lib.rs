@@ -511,6 +511,8 @@ pub fn run(path: &Path) -> Result<(), Failure> {
     shell.app.draw_pictures(drawn);
     frame.draw_svg(drawn);
     shell.pictures.pick(picker);
+    // The window the cell was measured in, which a later resize is scaled from.
+    shell.follow_window();
     if ask {
         // On Windows the query drops a resize that came in during it, and it is
         // sent blind there, so it may have printed.
@@ -1179,6 +1181,15 @@ impl Drop for Shell {
 }
 
 impl Shell {
+    /// Tell the pictures the window's size now, which the cell follows.
+    fn follow_window(&mut self) {
+        if self.pictures.follows_cell()
+            && let Ok(window) = ratatui::crossterm::terminal::window_size()
+        {
+            self.pictures.window_sized(window);
+        }
+    }
+
     /// Send the Kitty deletes owed. A failed write leaves the images to the
     /// terminal's own quota.
     fn write_retired(&mut self) {
@@ -1382,6 +1393,9 @@ impl Shell {
             if let Err(e) = self.session.screen().clear() {
                 self.app.warn(format!("redraw: {e}"));
             }
+        }
+        if matches!(action, Action::Redraw | Action::Refresh) {
+            self.follow_window();
         }
         if !matches!(action, Action::Redraw | Action::Refresh) {
             self.deselect();
@@ -2583,6 +2597,24 @@ mod tests {
             ),
             "`Ctrl+L` no longer retires the Kitty pictures and clears the screen"
         );
+    }
+
+    #[test]
+    fn resize_follows_cell() {
+        // `Shell` holds a terminal, so the route is read rather than driven.
+        let source = include_str!("lib.rs");
+        let shipped = source.split("#[cfg(test)]").next().expect("split");
+        for route in [
+            "    shell.pictures.pick(picker);\n",
+            "    shell.follow_window();\n",
+            "if matches!(action, Action::Redraw | Action::Refresh) {\n            self.follow_window();",
+            "self.pictures.window_sized(window);",
+        ] {
+            assert!(
+                shipped.contains(route),
+                "the cell no longer follows the window: {route}"
+            );
+        }
     }
 
     #[test]
