@@ -3336,7 +3336,7 @@ fn nextest_runs_the_suite() {
 #[test]
 fn cache_saved_from_main_only() {
     let ci = without_comments(&repo_file(".github/workflows/ci.yml"));
-    let uses: Vec<&str> = ci.split("- uses: Swatinem/rust-cache@v2").skip(1).collect();
+    let uses: Vec<&str> = ci.split("- uses: Swatinem/rust-cache@").skip(1).collect();
     assert!(
         uses.len() >= 6,
         "ci.yml uses rust-cache {} time(s), so this gate reads too little",
@@ -3687,5 +3687,122 @@ fn nextest_time_bound() {
         unbounded_profiles(&config, &["default", "ci", "mutants"]),
         Vec::<&str>::new(),
         "a nextest profile never kills a hung test"
+    );
+}
+
+/// The crates `deny.toml`'s `bans.deny` list bans outright, by name. An entry
+/// with `wrappers` is let through those crates, so it does not count.
+fn denied_crates(config: &str) -> Vec<String> {
+    let config = format!("\n{}", without_comments(config));
+    let Some((_, bans)) = config.split_once("\n[bans]") else {
+        return Vec::new();
+    };
+    let bans = bans.split("\n[").next().unwrap_or_default();
+    let Some((_, deny)) = bans.split_once("\ndeny = [") else {
+        return Vec::new();
+    };
+    let deny = deny.split("\n]").next().unwrap_or_default();
+    deny.lines()
+        .filter(|entry| !entry.contains("wrappers"))
+        .filter_map(|entry| entry.split_once("crate = \""))
+        .filter_map(|(_, rest)| rest.split_once('"').map(|(name, _)| name.to_owned()))
+        .collect()
+}
+
+/// The crates SPEC §6 rules out that `config` does not ban.
+fn missing_bans(config: &str) -> Vec<&'static str> {
+    let denied = denied_crates(config);
+    [
+        "cc",
+        "cmake",
+        "bindgen",
+        "onig_sys",
+        "aws-lc-sys",
+        "ring",
+        "openssl-sys",
+    ]
+    .into_iter()
+    .filter(|name| !denied.iter().any(|ban| ban == name))
+    .collect()
+}
+
+/// `deny.toml` reads the graph the release ships: the dist targets, and bans
+/// every crate that brings a C toolchain.
+#[test]
+fn deny_policy() {
+    let fixture = "[bans]\nskip = [\n    { crate = \"ring\" },\n]\ndeny = [\n    { crate = \"cc\", reason = \"x\" },\n    { crate = \"cmake\", wrappers = [\"x\"] },\n]\n[sources]\n";
+    assert_eq!(
+        missing_bans(fixture),
+        [
+            "cmake",
+            "bindgen",
+            "onig_sys",
+            "aws-lc-sys",
+            "ring",
+            "openssl-sys"
+        ],
+        "the scan missed which bans are absent"
+    );
+    let deny = repo_file("deny.toml");
+    assert_eq!(
+        missing_bans(&deny),
+        Vec::<&str>::new(),
+        "deny.toml does not ban these"
+    );
+    // The licences `cargo deny list` found the release graph needs, 2026-10-20.
+    let mut allowed = toml_array(&deny, "allow");
+    allowed.sort();
+    assert_eq!(
+        allowed,
+        [
+            "0BSD",
+            "Apache-2.0",
+            "Apache-2.0 WITH LLVM-exception",
+            "BSD-2-Clause",
+            "BSD-3-Clause",
+            "BSL-1.0",
+            "CC0-1.0",
+            "CDLA-Permissive-2.0",
+            "ISC",
+            "MIT",
+            "MIT-0",
+            "MPL-2.0",
+            "Unicode-3.0",
+            "Unlicense",
+            "Zlib",
+        ],
+        "deny.toml allows other licences than the graph needs"
+    );
+    assert!(
+        without_comments(&deny).contains("unused-allowed-license = \"deny\""),
+        "an allowance the graph no longer needs would pass"
+    );
+    let manifest = repo_file("Cargo.toml");
+    let dist = manifest
+        .split_once("[workspace.metadata.dist]")
+        .map(|(_, rest)| rest.split("\n[").next().unwrap_or_default())
+        .expect("a dist table");
+    assert_eq!(
+        toml_array(&deny, "targets"),
+        toml_array(&format!("\n{dist}"), "targets"),
+        "deny.toml checks other targets than the release builds"
+    );
+    let ci = without_comments(&repo_file(".github/workflows/ci.yml"));
+    assert!(
+        ci.contains("cargo deny check advisories licenses sources")
+            && ci.contains("cargo deny --exclude-dev check bans"),
+        "ci.yml does not run the full dependency check"
+    );
+    assert!(
+        ci.contains("'deny=${{ needs.deny.result }}'")
+            && jobs_of(&ci)
+                .iter()
+                .any(|(job, block)| job == "ci-complete" && block.contains(" deny,")),
+        "ci complete does not wait for and judge the dependency check"
+    );
+    let weekly = without_comments(&repo_file(".github/workflows/deny.yml"));
+    assert!(
+        weekly.contains("cargo deny check advisories") && weekly.contains("schedule:"),
+        "main is not checked for new advisories on a schedule"
     );
 }
