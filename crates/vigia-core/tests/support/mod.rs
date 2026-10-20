@@ -107,11 +107,13 @@ fn thread_cpu() -> Option<Duration> {
 }
 
 /// This thread's cycles so far, converted at the highest rate calibration
-/// measured. Cycles count at the fixed timestamp rate while the thread runs, so
-/// a slice the thread lost time in reads a lower rate, and the highest is at
-/// most the true one: it reads as no less CPU than ran, and no overshoot is
-/// excused by the conversion. `None` where the rate could not be measured,
-/// which counts every frame's wall time as its own. `GetThreadTimes` steps at
+/// measured. Cycles count at a fixed rate while the thread runs, so a slice
+/// the thread lost time in reads a lower rate, and the highest is at most the
+/// true one: it reads as no less CPU than ran, and no overshoot is excused by
+/// the conversion. Microsoft's `QueryThreadCycleTime` page says not to convert
+/// cycles to time at all; `cycle_clock_direction` checks that this one holds.
+/// `None` where the rate could not be measured, which counts every frame's
+/// wall time as its own. `GetThreadTimes` steps at
 /// 15.625ms, too coarse to judge one frame.
 #[cfg(windows)]
 fn thread_cpu() -> Option<Duration> {
@@ -132,6 +134,29 @@ fn thread_cycles() -> Option<u64> {
     // close. The call writes only through that pointer.
     let ok = unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut cycles) } != 0;
     ok.then_some(cycles)
+}
+
+/// This thread's kernel plus user time from `GetThreadTimes`, in clock
+/// interrupt steps ([`COARSE_TICK`] by default).
+#[cfg(windows)]
+pub fn thread_times() -> Option<Duration> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+    let [mut created, mut exited, mut kernel, mut user] = [FILETIME::default(); 4];
+    // SAFETY: four live locals of the type the call writes, and a pseudo-handle
+    // that needs no close.
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    } != 0;
+    let hundreds = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    ok.then(|| Duration::from_nanos((hundreds(kernel) + hundreds(user)) * 100))
 }
 
 /// The most cycles a nanosecond of busy work took over a calibration spin,
