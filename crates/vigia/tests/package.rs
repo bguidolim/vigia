@@ -3911,6 +3911,7 @@ fn split_actions(
 fn actions_one_version() {
     let mut seen: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
+    let mut released = std::collections::BTreeSet::new();
     for entry in std::fs::read_dir(repo_root().join(".github/workflows")).expect("the workflows") {
         let path = entry.expect("an entry").path();
         for line in without_comments(&read(&path)).lines() {
@@ -3922,6 +3923,9 @@ fn actions_one_version() {
                 continue;
             };
             if let Some((action, rev)) = target.trim().split_once('@') {
+                if path.ends_with("release.yml") {
+                    released.insert(action.to_owned());
+                }
                 seen.entry(action.to_owned())
                     .or_default()
                     .insert(rev.to_owned());
@@ -3948,6 +3952,13 @@ fn actions_one_version() {
         seen.entry(action.to_owned())
             .or_default()
             .insert(rev.to_owned());
+    }
+    // `dist generate` writes back the tag of any action it does not pin.
+    for action in &released {
+        assert!(
+            pins.contains(&format!("\"{action}\"")),
+            "dist does not pin {action}"
+        );
     }
     assert_eq!(
         split_actions(&seen),
@@ -4011,4 +4022,63 @@ fn permissions_declared() {
         ["b"],
         "the scan missed a job"
     );
+}
+
+/// Each release archive is attested and each binary carries its crate list.
+#[test]
+fn release_attested() {
+    let manifest = repo_file("Cargo.toml");
+    for setting in ["github-attestations = true", "cargo-auditable = true"] {
+        assert!(
+            manifest.lines().any(|line| line == setting),
+            "[workspace.metadata.dist] does not set {setting}"
+        );
+    }
+    let release = without_comments(&repo_file(".github/workflows/release.yml"));
+    let jobs = jobs_of(&release);
+    let attesting: Vec<&str> = jobs
+        .iter()
+        .filter(|(_, block)| block.contains("\"attestations\": \"write\""))
+        .map(|(job, _)| job.as_str())
+        .collect();
+    assert_eq!(
+        attesting,
+        ["host"],
+        "the attestation scopes reach other jobs"
+    );
+    let host = jobs
+        .iter()
+        .find(|(job, _)| job == "host")
+        .map(|(_, block)| block.as_str())
+        .expect("dist's host job");
+    assert!(
+        host.contains("uses: actions/attest@"),
+        "the host job attests nothing"
+    );
+    let signing: Vec<&str> = jobs
+        .iter()
+        .filter(|(_, block)| block.contains("\"id-token\": \"write\""))
+        .map(|(job, _)| job.as_str())
+        .collect();
+    assert_eq!(
+        signing,
+        ["host", "custom-publish-crates-io"],
+        "an OIDC token reaches a job that neither attests nor publishes"
+    );
+    assert!(
+        jobs.iter()
+            .any(|(job, block)| job == "build-local-artifacts"
+                && block.contains("Install cargo-auditable")),
+        "the build job builds without cargo-auditable"
+    );
+    // No job that can sign as this repository runs a script fetched unpinned.
+    for (job, block) in &jobs {
+        let signs = block.contains("\"id-token\": \"write\"")
+            || block.contains("\"attestations\": \"write\"");
+        assert!(
+            !signs
+                || !(block.contains("curl ") || block.contains("| sh") || block.contains("| iex")),
+            "job `{job}` holds a signing scope and runs a fetched script"
+        );
+    }
 }
