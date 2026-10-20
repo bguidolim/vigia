@@ -1360,7 +1360,7 @@ fn svg_tree(bytes: &[u8]) -> Option<resvg::usvg::Tree> {
     };
     // `<text>`, or `<svg:text>` under a prefix.
     if bytes
-        .windows(5)
+        .array_windows()
         .any(|window| window == b"<text" || window == b":text")
     {
         options.fontdb = fonts();
@@ -1423,7 +1423,7 @@ fn read_counted(source: &Source) -> Option<Vec<u8>> {
     let bytes = source.read()?;
     vigia_core::armed(Stage::Decode);
     if std::thread::current().name() == Some(WORKER) {
-        DECODED.set(DECODED.get() + 1);
+        DECODED.update(|v| v + 1);
     } else {
         OFF_WORKER.fetch_add(1, Ordering::Relaxed);
     }

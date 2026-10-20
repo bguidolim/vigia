@@ -333,7 +333,7 @@ Milestone: [Phase 9](https://github.com/breferrari/vigia/milestone/10). Ships in
 
 | | Task | Issue |
 |---|---|---|
-| 🔨 | Side-by-side image diff **Split into the rows below** | [#632](https://github.com/breferrari/vigia/issues/632) |
+| ✅ | Side-by-side image diff **Split into the rows below** | [#632](https://github.com/breferrari/vigia/issues/632) |
 | ✅ | Image size line | [#633](https://github.com/breferrari/vigia/issues/633) |
 | ✅ | Half-block image panels | [#634](https://github.com/breferrari/vigia/issues/634) |
 | ✅ | Real-pixel image protocols | [#635](https://github.com/breferrari/vigia/issues/635) |
@@ -363,7 +363,7 @@ Milestone: [Phase 10](https://github.com/breferrari/vigia/milestone/11). Ships i
 
 | | Task | Issue |
 |---|---|---|
-| ⬜ | Adopt Rust 1.99 features | [#642](https://github.com/breferrari/vigia/issues/642) |
+| ✅ | Adopt Rust 1.99 features | [#642](https://github.com/breferrari/vigia/issues/642) |
 
 ## Phase 11 — off the paint
 

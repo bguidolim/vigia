@@ -15,7 +15,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # A warning that reaches main is a warning nobody will ever fix.
-  RUSTFLAGS: -D warnings
+  CARGO_BUILD_WARNINGS: deny
 
 concurrency:
   # Keyed on the draft flag too: a push made while the PR is a draft and the
