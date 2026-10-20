@@ -973,6 +973,33 @@ fn a_breach_with_no_cpu_clock_is_treated_as_ours() {
     );
 }
 
+/// Windows' cycle clock reads a busy spin as at least nine tenths of its wall
+/// time, and never more than twice it. Converted at the highest calibrated
+/// rate it may read high, when every slice was preempted, and must not read
+/// low; both bounds fail if the timestamp rate is not invariant.
+#[cfg(windows)]
+#[test]
+fn cycle_clock_direction() {
+    assert!(
+        support::cycle_rate().is_some(),
+        "the cycle rate was not measured"
+    );
+    let busy = Duration::from_millis(100);
+    let mut read = Vec::new();
+    for _ in 0..5 {
+        let (wall, cpu) = time_cpu(|| support::spin_for(busy));
+        assert!(
+            cpu <= wall * 2,
+            "a busy spin of {wall:?} read as {cpu:?} of CPU, past twice its wall time"
+        );
+        read.push((wall, cpu));
+        if cpu.as_secs_f64() >= wall.as_secs_f64() * 0.9 {
+            return;
+        }
+    }
+    panic!("no busy spin read as nine tenths of its wall time: {read:?}");
+}
+
 #[test]
 fn the_cpu_clock_tells_waiting_from_working() {
     // Non-vacuity for the two gates above, and the only thing here that touches the

@@ -85,6 +85,14 @@ pub fn timed_cpu<T>(work: impl FnOnce() -> T) -> (T, Duration, Duration) {
     (value, wall, cpu)
 }
 
+/// Keep this thread busy for `length` of wall time.
+pub fn spin_for(length: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < length {
+        std::hint::spin_loop();
+    }
+}
+
 /// This thread's CPU time so far, or `None` where the platform has no clock.
 #[cfg(unix)]
 fn thread_cpu() -> Option<Duration> {
@@ -98,31 +106,58 @@ fn thread_cpu() -> Option<Duration> {
     ok.then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
 }
 
+/// This thread's cycles so far, converted at the highest rate calibration
+/// measured. Cycles count at the fixed timestamp rate while the thread runs, so
+/// a slice the thread lost time in reads a lower rate, and the highest is at
+/// most the true one: it reads as no less CPU than ran, and no overshoot is
+/// excused by the conversion. `None` where the rate could not be measured,
+/// which counts every frame's wall time as its own. `GetThreadTimes` steps at
+/// 15.625ms, too coarse to judge one frame.
 #[cfg(windows)]
 fn thread_cpu() -> Option<Duration> {
-    use windows_sys::Win32::Foundation::FILETIME;
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-
-    let mut created = FILETIME::default();
-    let mut exited = FILETIME::default();
-    let mut kernel = FILETIME::default();
-    let mut user = FILETIME::default();
-    // SAFETY: four out-parameters, all owned here, and a pseudo-handle that needs
-    // no close. The call writes only through those pointers.
-    let ok = unsafe {
-        GetThreadTimes(
-            GetCurrentThread(),
-            &mut created,
-            &mut exited,
-            &mut kernel,
-            &mut user,
-        )
-    } != 0;
-    // Both halves, in units of a hundred nanoseconds. Kernel time is ours: a
-    // syscall the frame makes is work the frame did.
-    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
-    ok.then(|| Duration::from_nanos((ticks(kernel) + ticks(user)) * 100))
+    let rate = cycle_rate()?;
+    Some(Duration::from_nanos(
+        (thread_cycles()? as f64 / rate) as u64,
+    ))
 }
+
+/// This thread's cycles so far.
+#[cfg(windows)]
+fn thread_cycles() -> Option<u64> {
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
+    use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
+
+    let mut cycles = 0u64;
+    // SAFETY: one out-parameter owned here, and a pseudo-handle that needs no
+    // close. The call writes only through that pointer.
+    let ok = unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut cycles) } != 0;
+    ok.then_some(cycles)
+}
+
+/// The most cycles a nanosecond of busy work took over a calibration spin,
+/// measured once per test binary.
+#[cfg(windows)]
+pub fn cycle_rate() -> Option<f64> {
+    static RATE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| {
+        let mut fastest: Option<f64> = None;
+        for _ in 0..CALIBRATION_SLICES {
+            let (cycles, start) = (thread_cycles()?, Instant::now());
+            spin_for(CALIBRATION_SLICE);
+            let spun = thread_cycles()?.checked_sub(cycles)?;
+            let rate = spun as f64 / start.elapsed().as_nanos() as f64;
+            fastest = Some(fastest.map_or(rate, |was: f64| was.max(rate)));
+        }
+        fastest.filter(|rate| *rate > 0.0)
+    })
+}
+
+/// Busy slices the cycle rate is measured over.
+#[cfg(windows)]
+const CALIBRATION_SLICES: usize = 10;
+/// One slice's length.
+#[cfg(windows)]
+const CALIBRATION_SLICE: Duration = Duration::from_millis(20);
 
 #[cfg(not(any(unix, windows)))]
 fn thread_cpu() -> Option<Duration> {
@@ -202,12 +237,8 @@ pub fn holds_p99(
 pub const COARSE_TICK: Duration = Duration::from_micros(15_625);
 
 /// This platform's thread clock step. Linux and macOS count in nanoseconds and
-/// microseconds.
-pub const CLOCK_TICK: Duration = if cfg!(windows) {
-    COARSE_TICK
-} else {
-    Duration::from_micros(1)
-};
+/// microseconds, and Windows in cycles.
+pub const CLOCK_TICK: Duration = Duration::from_micros(1);
 
 /// Breaching wall time a coarse clock needs before it can tell the host from
 /// the work, in its own ticks.
