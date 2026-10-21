@@ -4,6 +4,10 @@ Every released version of `vigia`, newest first. The date is the day the release
 
 Each version lists the pull requests labelled `release`, one line each: what the pane shows or does, a key or gesture, a theme, installation, or the MCP tools. Internal work such as CI, tests and documentation is not listed.
 
+## [1.2.1] - 2026-10-21
+
+- Pictures draw at their true size, shrink to fit a narrow pane instead of disappearing, and are sharp on a Retina Mac whose terminal does not report its cell size.
+
 ## [1.2.0] - 2026-10-21
 
 vigia 1.2.0 shows pictures. A changed image appears as its old and new versions side by side, with the changed pixels marked: PNG, JPEG, GIF, WebP, SVG, and the first changed page of a PDF. It uses the terminal's image protocol where there is one (Kitty graphics, Sixel, iTerm2) and coloured half blocks where there isn't. Every build draws them, `cargo install vigia` included.
