@@ -2,7 +2,8 @@
 //! the Unicode placeholder cells that place it. `SPEC.md` §11.1.
 
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::num::NonZeroU16;
 
@@ -23,7 +24,7 @@ const UNIT_WIDTH: CellDiffOption = CellDiffOption::ForcedWidth(NonZeroU16::MIN);
 
 /// The transmit of `rgba`, `width` by `height` pixels, as image `id` placed
 /// virtually over `cells`: one escape a chunk, and under tmux each in its own
-/// passthrough.
+/// passthrough, and where each chunk ends.
 fn transmit(
     rgba: &[u8],
     (width, height): (u32, u32),
@@ -31,7 +32,7 @@ fn transmit(
     id: u32,
     tmux: bool,
     compress: bool,
-) -> String {
+) -> (String, Vec<usize>) {
     let deflated;
     let bytes = if compress {
         deflated = zlib(rgba);
@@ -43,6 +44,7 @@ fn transmit(
     let pieces = bytes.chunks(CHUNK / 4 * 3);
     let count = pieces.len();
     let mut out = String::with_capacity(count * (CHUNK + 32) + 96);
+    let mut ends = Vec::with_capacity(count);
     for (i, piece) in pieces.enumerate() {
         out.push_str(start);
         let _ = write!(out, "{escape}_Gq=2,");
@@ -58,8 +60,28 @@ fn transmit(
         base64_simd::STANDARD.encode_append(piece, &mut out);
         let _ = write!(out, "{escape}\\");
         out.push_str(end);
+        ends.push(out.len());
     }
-    out
+    (out, ends)
+}
+
+/// A string terminator, through tmux if `tmux`.
+pub fn string_end(tmux: bool) -> String {
+    let (start, escape, end) = Parser::tmux_start_escape_end(tmux);
+    format!("{start}{escape}\\{end}")
+}
+
+/// The empty last chunk that closes an image left part sent.
+pub fn cancel(tmux: bool) -> String {
+    let (start, escape, end) = Parser::tmux_start_escape_end(tmux);
+    format!("{start}{escape}_Gm=0,q=2;{escape}\\{end}")
+}
+
+/// The delete of image `id`. `q=2`: an answer would reach the event reader
+/// as keys.
+pub fn delete(id: u32, tmux: bool) -> String {
+    let (start, escape, end) = Parser::tmux_start_escape_end(tmux);
+    format!("{start}{escape}_Ga=d,d=I,i={id},q=2{escape}\\{end}")
 }
 
 /// The least of an image [`worth_deflating`] deflates to decide.
@@ -95,9 +117,8 @@ fn zlib(raw: &[u8]) -> Vec<u8> {
 }
 
 /// Draw image `id`'s placeholder cells over all of `room`, its first `skip`
-/// rows above it. `leading` goes in front of the first cell, as the transmit
-/// does on the frame that sends it.
-fn placeholders(room: Rect, id: u32, skip: u16, buf: &mut Buffer, mut leading: Option<&str>) {
+/// rows above it.
+fn placeholders(room: Rect, id: u32, skip: u16, buf: &mut Buffer) {
     let [high, r, g, b] = id.to_be_bytes();
     let fg = Color::Rgb(r, g, b);
     let mut symbol = String::with_capacity(64);
@@ -107,9 +128,6 @@ fn placeholders(room: Rect, id: u32, skip: u16, buf: &mut Buffer, mut leading: O
                 continue;
             };
             symbol.clear();
-            if let Some(leading) = leading.take() {
-                symbol.push_str(leading);
-            }
             symbol.push(PLACEHOLDER);
             if x == 0 {
                 symbol.push(diacritic(y + skip));
@@ -127,9 +145,53 @@ fn placeholders(room: Rect, id: u32, skip: u16, buf: &mut Buffer, mut leading: O
 pub struct Image {
     id: u32,
     cells: Size,
-    transmit: String,
-    sent: AtomicBool,
+    transmit: Arc<str>,
+    ends: Arc<[usize]>,
+    tmux: bool,
     deflated: bool,
+    /// [`IDLE`], [`QUEUED`] or [`WRITTEN`] in the low bits, and above them
+    /// which upload it is, so a report from one cut off marks no later one.
+    state: Arc<AtomicU64>,
+}
+
+/// Not with the writer.
+const IDLE: u64 = 0;
+/// Handed to the writer and not yet written whole.
+const QUEUED: u64 = 1;
+/// Written whole, so its cells may be drawn.
+const WRITTEN: u64 = 2;
+/// The bits of [`Image::state`] that hold the state.
+const STATE: u64 = 3;
+
+/// One upload's hold on its image's state: written, it marks the image held;
+/// dropped unwritten, it puts the image back to be sent again. A later upload
+/// of the image is a different generation, which neither touches.
+pub struct Ticket {
+    state: Arc<AtomicU64>,
+    queued: u64,
+}
+
+impl Ticket {
+    /// Its last chunk was written.
+    pub fn written(&self) {
+        let _ = self.state.compare_exchange(
+            self.queued,
+            self.queued - QUEUED + WRITTEN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        let _ = self.state.compare_exchange(
+            self.queued,
+            self.queued - QUEUED + IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 impl Image {
@@ -156,13 +218,59 @@ impl Image {
         tmux: bool,
         compress: bool,
     ) -> Self {
+        let (transmit, ends) = transmit(rgba, pixels, cells, id, tmux, compress);
         Self {
             id,
             cells,
-            transmit: transmit(rgba, pixels, cells, id, tmux, compress),
-            sent: AtomicBool::new(false),
+            transmit: transmit.into(),
+            ends: ends.into(),
+            tmux,
             deflated: compress,
+            state: Arc::new(AtomicU64::new(IDLE)),
         }
+    }
+
+    /// The id the terminal knows it by.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Its transmit, once: none if it is already with the writer or written.
+    pub fn upload(&self) -> Option<crate::writer::Upload> {
+        let now = self.state.load(Ordering::Acquire);
+        if now & STATE != IDLE {
+            return None;
+        }
+        let queued = (now & !STATE) + (STATE + 1) + QUEUED;
+        self.state
+            .compare_exchange(now, queued, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(crate::writer::Upload {
+            id: self.id,
+            data: Arc::clone(&self.transmit),
+            ends: Arc::clone(&self.ends),
+            close: cancel(self.tmux).into(),
+            tmux: self.tmux,
+            ticket: Ticket {
+                state: Arc::clone(&self.state),
+                queued,
+            },
+        })
+    }
+
+    /// Whether the terminal has all of it, so its cells place it.
+    pub fn uploaded(&self) -> bool {
+        self.state.load(Ordering::Acquire) & STATE == WRITTEN
+    }
+
+    /// Its upload stops: send it again when next shown. Whether it was still
+    /// in flight, so the terminal may hold part of it.
+    pub fn unsent(&self) -> bool {
+        self.state
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |now| {
+                (now & STATE == QUEUED).then_some(now - QUEUED + IDLE)
+            })
+            .is_ok()
     }
 
     /// Whether its transmit is deflated.
@@ -175,8 +283,8 @@ impl Image {
         self.cells
     }
 
-    /// Draw it into `area` with its first `above` rows scrolled above the
-    /// area's top. The first draw carries the transmit.
+    /// Draw its cells into `area` with its first `above` rows scrolled above
+    /// the area's top. The transmit goes separately, before.
     pub fn render(&self, area: Rect, buf: &mut Buffer, above: u16) {
         // A position past the table cannot be encoded, so it is left undrawn
         // rather than drawn at the wrong offset.
@@ -189,12 +297,10 @@ impl Image {
                 .min(most.saturating_sub(above)),
             ..area
         };
-        // Otherwise no cell would carry the transmit, and it would be lost.
-        if room.is_empty() || !buf.area().contains((room.x, room.y).into()) {
+        if room.is_empty() {
             return;
         }
-        let first = (!self.sent.swap(true, Ordering::AcqRel)).then_some(self.transmit.as_str());
-        placeholders(room, self.id, above, buf, first);
+        placeholders(room, self.id, above, buf);
     }
 }
 
@@ -248,6 +354,21 @@ static DIACRITICS: [char; 297] = [
     '\u{1D188}', '\u{1D189}', '\u{1D1AA}', '\u{1D1AB}', '\u{1D1AC}', '\u{1D1AD}', '\u{1D242}', '\u{1D243}',
     '\u{1D244}',
 ];
+
+/// For a writer test: a ticket of an image just queued, and whether that
+/// image is now held.
+#[cfg(test)]
+pub(crate) fn ticket() -> (Ticket, impl Fn() -> bool) {
+    let state = Arc::new(AtomicU64::new((STATE + 1) + QUEUED));
+    let read = Arc::clone(&state);
+    let ticket = Ticket {
+        state,
+        queued: (STATE + 1) + QUEUED,
+    };
+    (ticket, move || {
+        read.load(Ordering::Acquire) & STATE == WRITTEN
+    })
+}
 
 /// Bytes no deflate shrinks, as a photograph's nearly are.
 #[cfg(test)]
@@ -323,6 +444,13 @@ mod tests {
         );
         let mut buf = Buffer::empty(frame(area));
         image.render(area, &mut buf, skip);
+        // Where the crate puts the transmit, so the two compare whole.
+        if let Some(cell) = buf.cell_mut((area.x, area.y))
+            && cell.symbol().starts_with(PLACEHOLDER)
+        {
+            let joined = format!("{}{}", image.transmit, cell.symbol());
+            cell.set_symbol(&joined);
+        }
         buf
     }
 
@@ -398,8 +526,9 @@ mod tests {
     }
 
     #[test]
-    fn kitty_once() {
-        // The transmit rides the first frame that draws the image and no other.
+    fn upload_once() {
+        // Handed to the writer once; again only after a cancel; never once
+        // written whole. Its cells carry no transmit.
         let pixels = image(40, 40);
         let image = Image::new(
             pixels.as_raw(),
@@ -409,20 +538,86 @@ mod tests {
             false,
             false,
         );
+        let upload = image.upload().expect("the first upload");
+        assert_eq!(upload.data.len(), *upload.ends.last().expect("a chunk"));
+        assert!(
+            image.upload().is_none(),
+            "the same image was handed over twice"
+        );
+        image.unsent();
+        let again = image
+            .upload()
+            .expect("a cancelled image was not sent again");
+        again.ticket.written();
+        image.unsent();
+        assert!(
+            image.upload().is_none(),
+            "an image written whole was sent again"
+        );
         let area = Rect::new(0, 0, 4, 2);
-        let drawn = |image: &Image| {
-            let mut buf = Buffer::empty(area);
-            image.render(area, &mut buf, 0);
+        let mut buf = Buffer::empty(area);
+        image.render(area, &mut buf, 0);
+        assert!(
             buf.content()
                 .iter()
-                .map(|cell| cell.symbol().len())
-                .sum::<usize>()
-        };
-        let (first, second) = (drawn(&image), drawn(&image));
-        assert!(
-            first > second + 1000 && second > 0,
-            "the transmit was not sent exactly once: {first} then {second} bytes of cells"
+                .all(|cell| !cell.symbol().contains("_G")),
+            "a cell carried a graphics escape"
         );
+    }
+
+    #[test]
+    fn late_report() {
+        // The report of an upload stopped since marks nothing: not the image
+        // left idle, and not the upload sent after it.
+        let pixels = image(40, 40);
+        let image = Image::new(
+            pixels.as_raw(),
+            pixels.dimensions(),
+            Size::new(4, 2),
+            3,
+            false,
+            false,
+        );
+        let first = image.upload().expect("an upload");
+        image.unsent();
+        first.ticket.written();
+        assert!(!image.uploaded(), "a stopped upload was taken as held");
+        let second = image.upload().expect("sent again");
+        let first_again = image.upload();
+        assert!(first_again.is_none(), "handed out twice");
+        assert!(!image.uploaded(), "held before its own report");
+        second.ticket.written();
+        assert!(
+            image.uploaded(),
+            "the upload written whole was not taken as held"
+        );
+    }
+
+    #[test]
+    fn ticket_kept() {
+        // An upload dropped unwritten puts its image back to be sent; one
+        // written whole is not taken back as stopped.
+        let pixels = image(40, 40);
+        let image = Image::new(
+            pixels.as_raw(),
+            pixels.dimensions(),
+            Size::new(4, 2),
+            3,
+            false,
+            false,
+        );
+        drop(image.upload().expect("an upload"));
+        let upload = image
+            .upload()
+            .expect("a dropped upload's image was not sent again");
+        upload.ticket.written();
+        assert!(
+            !image.unsent(),
+            "an image written whole was taken as stopped"
+        );
+        assert!(image.uploaded(), "a stop undid an image written whole");
+        drop(upload);
+        assert!(image.uploaded(), "dropping a written upload undid it");
     }
 
     #[test]
@@ -430,7 +625,7 @@ mod tests {
         // 3072 bytes of pixels are exactly one full chunk, and 6144 exactly two.
         for (height, count) in [(24, 1), (48, 2)] {
             let pixels = image(32, height);
-            let sent = transmit(
+            let (sent, ends) = transmit(
                 pixels.as_raw(),
                 pixels.dimensions(),
                 Size::new(4, 2),
@@ -439,6 +634,7 @@ mod tests {
                 false,
             );
             let chunks: Vec<&str> = sent.split_inclusive("\x1b\\").collect();
+            assert_eq!(ends.len(), chunks.len(), "a chunk end was not recorded");
             assert_eq!(
                 chunks.len(),
                 count,
@@ -468,27 +664,6 @@ mod tests {
         assert!(
             !drawn(287),
             "row 297, past the table, was drawn as another row"
-        );
-    }
-
-    #[test]
-    fn transmit_kept_offscreen() {
-        // A draw that lands outside the buffer leaves the transmit for the next.
-        let pixels = image(40, 40);
-        let image = Image::new(
-            pixels.as_raw(),
-            pixels.dimensions(),
-            Size::new(4, 2),
-            3,
-            false,
-            false,
-        );
-        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
-        image.render(Rect::new(10, 10, 4, 2), &mut buf, 0);
-        image.render(Rect::new(0, 0, 4, 2), &mut buf, 0);
-        assert!(
-            buf[(0, 0)].symbol().contains("_Gq=2,i=3"),
-            "a draw outside the buffer spent the transmit"
         );
     }
 
@@ -534,7 +709,7 @@ mod tests {
         // decoded and inflated are the pixels.
         let pixels = image(300, 200);
         for compress in [false, true] {
-            let sent = transmit(
+            let (sent, ends) = transmit(
                 pixels.as_raw(),
                 pixels.dimensions(),
                 Size::new(30, 10),
@@ -543,6 +718,15 @@ mod tests {
                 compress,
             );
             let chunks: Vec<&str> = sent.split_inclusive("\x1b\\").collect();
+            let mut at = 0;
+            for (chunk, end) in chunks.iter().zip(&ends) {
+                assert_eq!(
+                    &sent[at..*end],
+                    *chunk,
+                    "a recorded end is not where its chunk ends"
+                );
+                at = *end;
+            }
             assert!(
                 chunks.len() > 1,
                 "the image fits one chunk, so this proves nothing"

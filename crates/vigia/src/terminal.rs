@@ -54,6 +54,10 @@ trait Console {
 
     /// Before the steps are given back: end whatever a frame left half written.
     fn ready(&mut self) {}
+
+    /// After [`Console::ready`], where no delete of the pane's may have gone
+    /// out: delete the Kitty images it last sent.
+    fn forget(&mut self) {}
 }
 
 /// The real console, over `crossterm`.
@@ -93,6 +97,28 @@ impl<W: Rearm> Console for Crossterm<W> {
     fn ready(&mut self) {
         self.out.rearm();
         let _ = self.out.write_all(crate::writer::STRING_END);
+        // Closed and deleted before the alternate screen goes, in whose own
+        // store kitty holds it.
+        if let Some((id, tmux)) = crate::writer::open_image() {
+            // tmux holds a passthrough until it ends, then forwards it whole:
+            // the terminator above ends ours, and this one reaches the escape it
+            // left open in the outer terminal (tmux 3.8 `input.c`, read).
+            let ended = if tmux {
+                crate::kitty::string_end(true)
+            } else {
+                String::new()
+            };
+            let closed = ended + &crate::kitty::cancel(tmux) + &crate::kitty::delete(id, tmux);
+            let _ = self.out.write_all(closed.as_bytes());
+        }
+    }
+
+    fn forget(&mut self) {
+        let deletes: String = crate::writer::sent_images()
+            .into_iter()
+            .map(|(id, tmux)| crate::kitty::delete(id, tmux))
+            .collect();
+        let _ = self.out.write_all(deletes.as_bytes());
     }
 
     fn take(&mut self, step: Step) -> io::Result<()> {
@@ -139,13 +165,16 @@ impl<C: Console> Takeover<C> {
 
 impl<C: Console> Drop for Takeover<C> {
     fn drop(&mut self) {
-        give_back_all(&mut self.console, self.taken);
+        give_back_all(&mut self.console, self.taken, false);
     }
 }
 
 /// Give the first `taken` steps of [`TAKEOVER`] back, in reverse.
-fn give_back_all<C: Console>(console: &mut C, taken: usize) {
+fn give_back_all<C: Console>(console: &mut C, taken: usize, forget: bool) {
     console.ready();
+    if forget {
+        console.forget();
+    }
     for step in TAKEOVER[..taken].iter().rev() {
         console.give_back(*step);
     }
@@ -220,6 +249,24 @@ impl Session {
     pub fn send(&mut self, sequence: &str) -> io::Result<()> {
         self.sends.send(sequence.as_bytes())
     }
+
+    /// Queue a Kitty image's chunks on the writer's graphics lane.
+    ///
+    /// # Errors
+    ///
+    /// The writer has stopped.
+    pub fn upload(&mut self, upload: crate::writer::Upload) -> io::Result<()> {
+        self.sends.upload(upload)
+    }
+
+    /// Delete Kitty image `id` with `bytes`, after stopping its upload.
+    ///
+    /// # Errors
+    ///
+    /// The writer has stopped.
+    pub fn delete(&mut self, id: u32, bytes: String) -> io::Result<()> {
+        self.sends.delete(id, bytes.into_bytes())
+    }
 }
 
 /// Refuse a standard output that is not a terminal.
@@ -246,6 +293,45 @@ pub fn panic_mid_frame() {
     out.flush().expect("hand over the frame");
     std::thread::sleep(std::time::Duration::from_millis(150));
     panic!("mid-frame on purpose");
+}
+
+/// For a test in a child process: take the terminal, start an upload of
+/// Kitty image 4242 too large to go out at once, and panic while it is part sent.
+#[doc(hidden)]
+pub fn panic_mid_upload() {
+    let rgba: Vec<u8> = (0..400u32 * 400 * 4)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let _held = upload_and_wait(&rgba, (400, 400), 4242);
+    panic!("mid-upload on purpose");
+}
+
+/// For a test in a child process: send Kitty image 4343 whole, then panic.
+#[doc(hidden)]
+pub fn panic_after_upload() {
+    let session = upload_and_wait(&[7; 16 * 16 * 4], (16, 16), 4343);
+    let _ = session.writer().drain(std::time::Duration::from_secs(2));
+    panic!("after an upload on purpose");
+}
+
+/// Take the terminal with the panic hook in place, hand the writer `rgba` as
+/// Kitty image `id`, and give it a moment.
+fn upload_and_wait(rgba: &[u8], pixels: (u32, u32), id: u32) -> Session {
+    install_panic_hook();
+    let mut session = Session::enter(crate::writer::Wakes::none()).expect("take the terminal");
+    let image = crate::kitty::Image::new(
+        rgba,
+        pixels,
+        ratatui::layout::Size::new(40, 20),
+        id,
+        false,
+        false,
+    );
+    session
+        .upload(image.upload().expect("an upload"))
+        .expect("hand over the upload");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    session
 }
 
 /// For a test: whether standard output is nonblocking before the writer opens
@@ -275,13 +361,9 @@ fn install_hook() {
     install_abort_hook();
     install_hook_in(&HOOK, || {
         crate::writer::poison();
-        restore_everything(&mut Crossterm::on_terminal());
+        // A panic skips the drop that would have deleted the pane's images.
+        give_back_all(&mut Crossterm::on_terminal(), TAKEOVER.len(), true);
     });
-}
-
-/// Give back the whole of [`TAKEOVER`], whatever was actually taken.
-fn restore_everything<C: Console>(console: &mut C) {
-    give_back_all(console, TAKEOVER.len());
 }
 
 /// Chain `restore` onto the panic hook, at most once per `once`. A panic a
@@ -972,7 +1054,7 @@ mod tests {
     fn the_panic_hook_gives_back_everything_in_reverse() {
         // What the hook does, minus which console it writes to.
         let mut recorder = Recorder::new();
-        restore_everything(&mut recorder);
+        give_back_all(&mut recorder, TAKEOVER.len(), false);
 
         let mut expected = TAKEOVER.to_vec();
         expected.reverse();
@@ -1162,7 +1244,7 @@ mod tests {
             }
         }
         let mut console = Modes(Crossterm { out: Vec::new() });
-        give_back_all(&mut console, TAKEOVER.len());
+        give_back_all(&mut console, TAKEOVER.len(), false);
         let out = String::from_utf8(console.0.out).expect("utf8");
         assert!(
             out.starts_with("\x1b\\"),
@@ -1413,7 +1495,7 @@ mod tests {
         // The expectation is derived here, in the child, and that placement is the
         // whole of it.
         let mut owed = Crossterm { out: Vec::new() };
-        give_back_all(&mut owed, TAKEOVER.len());
+        give_back_all(&mut owed, TAKEOVER.len(), false);
 
         // Non-vacuity, asserted where the fact lives rather than inferred across a
         // process boundary.

@@ -88,7 +88,8 @@ pub use state::state_root;
 pub use terminal::output_flags;
 pub use terminal::{
     ANSWERING, BACKGROUND_WAIT, Background, Colours, PICTURES_WAIT, Screen, Session, ask,
-    background_of, colours_of, install_abort_hook, install_panic_hook, panic_mid_frame, picker,
+    background_of, colours_of, install_abort_hook, install_panic_hook, panic_after_upload,
+    panic_mid_frame, panic_mid_upload, picker,
 };
 pub use theme::{THEME_FILE, THEME_VAR, Theme, ThemeError};
 pub use update::{UPDATE_VAR, UpdateError};
@@ -1243,9 +1244,26 @@ impl Shell {
     /// Send the Kitty deletes owed. A failed write leaves the images to the
     /// terminal's own quota.
     fn write_retired(&mut self) {
-        let retired = self.pictures.retired();
-        if !retired.is_empty() {
-            let _ = self.session.send(&retired);
+        let retired = self.pictures.retired_ids();
+        self.delete_images(retired);
+    }
+
+    /// Delete Kitty images `ids`, each after its upload stops.
+    fn delete_images(&mut self, ids: Vec<u32>) {
+        let tmux = self.pictures.tmux();
+        for id in ids {
+            let _ = self.session.delete(id, kitty::delete(id, tmux));
+        }
+    }
+
+    /// Hand the writer the Kitty images now on screen, and stop the uploads of
+    /// those that left it. A stopped one is deleted, since the terminal may
+    /// hold part of it.
+    fn write_uploads(&mut self) {
+        let (uploads, stopped) = self.pictures.uploads();
+        self.delete_images(stopped);
+        for upload in uploads {
+            let _ = self.session.upload(upload);
         }
     }
 
@@ -2308,8 +2326,9 @@ impl Shell {
             &self.root,
         );
         // Before the draw, so the terminal drops the Kitty images of pictures that
-        // left the screen.
+        // left the screen, and takes those coming onto it.
         self.write_retired();
+        self.write_uploads();
         // Borrowed out of `self` before the draw, not for style: the closure would
         // otherwise hold `&self` while `self.session` is borrowed mutably to reach
         // the terminal.

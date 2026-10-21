@@ -31,6 +31,8 @@ struct Pane {
     history: History,
     width: u16,
     height: u16,
+    /// The Kitty transmits handed out since [`Pane::sent`] last took them.
+    sent: String,
 }
 
 impl Pane {
@@ -51,6 +53,7 @@ impl Pane {
             history: History::new(),
             width,
             height,
+            sent: String::new(),
         }
     }
 
@@ -79,6 +82,20 @@ impl Pane {
 
     /// One frame: the view, with the pictures attached as the shell attaches them.
     fn view(&mut self, frame: &mut Frame) -> View {
+        let mut view = self.unsent(frame);
+        // What the shell's writer does with an upload, at once: write it whole.
+        let uploads = self.pictures.written_at_once();
+        if !uploads.is_empty() {
+            for upload in uploads {
+                self.sent.push_str(&upload.data);
+            }
+            self.pictures.attach(&mut view.rows, frame);
+        }
+        view
+    }
+
+    /// [`Pane::view`] with no upload written.
+    fn unsent(&mut self, frame: &mut Frame) -> View {
         let body = self.body(frame);
         let mut view = self
             .app
@@ -86,6 +103,11 @@ impl Pane {
             .expect("view");
         self.pictures.attach(&mut view.rows, frame);
         view
+    }
+
+    /// The Kitty transmits handed out since the last call.
+    fn sent(&mut self) -> String {
+        std::mem::take(&mut self.sent)
     }
 
     /// A frame after every queued picture is built.
@@ -829,10 +851,11 @@ fn kitty_placement() {
     assert_eq!((kind, panels), (Kind::Three, 3));
     let first = pane.draw(&view);
     assert_eq!(
-        cells_with(&first, "\x1b_G"),
+        kitty_ids(&pane.sent()).len(),
         3,
-        "each panel's image is not sent once, in one cell"
+        "each panel's image is not sent once"
     );
+    assert_eq!(cells_with(&first, "\x1b_G"), 0, "a cell carried a transmit");
     let placed = cells_with(&first, &PLACEHOLDER.to_string());
     let slots: usize = sized_slots(&view).iter().map(|(w, r)| w * r).sum();
     assert!(
@@ -844,13 +867,100 @@ fn kitty_placement() {
         0,
         "a Kitty pane drew half-blocks"
     );
-    let again = pane.draw(&view);
-    assert_eq!(
-        cells_with(&again, "\x1b_G"),
-        0,
-        "an image already sent was sent again"
-    );
+    let next = pane.view(&mut frame);
+    let again = pane.draw(&next);
+    assert_eq!(pane.sent(), "", "an image already sent was sent again");
     assert_eq!(cells_with(&again, &PLACEHOLDER.to_string()), placed);
+}
+
+#[test]
+fn placed_after_upload() {
+    // Built but not yet in the terminal: the picture is held as one building.
+    // Once its uploads are written whole, it draws.
+    let (scratch, mut pane) = protocol_pane("pictures-kitty-upload", ProtocolType::Kitty);
+    let worktree = scratch.worktree();
+    let mut frame = worktree.frame();
+    frame.advance().expect("advance");
+    pane.settled(&mut frame);
+    pane.pictures.refresh();
+    pane.pictures.retired();
+    let mut view = pane.unsent(&mut frame);
+    assert!(
+        pane.pictures
+            .settle(support::ceiling(Duration::from_secs(60))),
+        "the pictures were not built"
+    );
+    pane.pictures.attach(&mut view.rows, &frame);
+    assert!(
+        picture_rows(&view).iter().all(|(_, built)| !built),
+        "a Kitty picture drew before the terminal held it"
+    );
+    let (uploads, _) = pane.pictures.uploads();
+    assert_eq!(uploads.len(), 3, "three uploads were not handed out");
+    for upload in uploads {
+        upload.ticket.written();
+    }
+    pane.pictures.attach(&mut view.rows, &frame);
+    assert!(
+        picture_rows(&view).iter().all(|(_, built)| *built),
+        "the picture did not draw once its uploads were written"
+    );
+    let drawn = pane.draw(&view);
+    assert!(
+        cells_with(&drawn, &PLACEHOLDER.to_string()) > 0 && cells_with(&drawn, "\x1b_G") == 0,
+        "the placed picture's cells carried a transmit, or none was placed"
+    );
+}
+
+#[test]
+fn upload_stopped_away() {
+    // An upload whose picture scrolls off before it is written is stopped,
+    // and handed out again when the picture comes back.
+    let scratch = Scratch::new("pictures-kitty-stopped");
+    scratch.write("a.png", png(120, 260, 1));
+    scratch.write("z.txt", support::numbered_lines(10));
+    scratch.commit_all("baseline");
+    scratch.write("a.png", png(120, 260, 2));
+    scratch.write("z.txt", support::numbered_lines(200));
+    let mut pane = Pane::drawn_by(100, 30, ProtocolType::Kitty);
+    let worktree = scratch.worktree();
+    let mut frame = worktree.frame();
+    frame.advance().expect("advance");
+    pane.unsent(&mut frame);
+    assert!(
+        pane.pictures
+            .settle(support::ceiling(Duration::from_secs(60))),
+        "the pictures were not built"
+    );
+    pane.unsent(&mut frame);
+    let (uploads, _) = pane.pictures.uploads();
+    let ids: Vec<u32> = uploads.iter().map(|upload| upload.id).collect();
+    assert_eq!(ids.len(), 3, "three uploads were not handed out");
+
+    pane.scroll(&mut frame, 150);
+    pane.unsent(&mut frame);
+    let (again, mut stopped) = pane.pictures.uploads();
+    stopped.sort_unstable();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert!(
+        again.is_empty(),
+        "an upload went out for a picture off screen"
+    );
+    assert_eq!(
+        stopped, sorted,
+        "the uploads of a picture that left were not stopped"
+    );
+
+    pane.scroll(&mut frame, -150);
+    pane.unsent(&mut frame);
+    let (back, stopped) = pane.pictures.uploads();
+    assert!(stopped.is_empty(), "an upload on screen was stopped");
+    assert_eq!(
+        back.len(),
+        3,
+        "the picture that came back was not sent again"
+    );
 }
 
 #[test]
@@ -876,7 +986,7 @@ fn scrolled_kitty_placement() {
     );
     let drawn = pane.draw(&view);
     assert_eq!(
-        cells_with(&drawn, "\x1b_G"),
+        kitty_ids(&pane.sent()).len(),
         3,
         "a picture cut by the top was not sent"
     );
@@ -946,16 +1056,13 @@ fn sized_slots(view: &View) -> Vec<(usize, usize)> {
         .unwrap_or_default()
 }
 
-/// The id a Kitty transmit names, from its `i=` key.
-fn kitty_ids(backend: &TestBackend) -> Vec<u32> {
-    backend
-        .buffer()
-        .content()
-        .iter()
-        .filter_map(|cell| {
-            let at = cell.symbol().find("a=T")?;
-            let head = &cell.symbol()[..at];
-            head.rsplit("i=").next()?.split(',').next()?.parse().ok()
+/// The id each Kitty transmit in `sent` names, from its `i=` key.
+fn kitty_ids(sent: &str) -> Vec<u32> {
+    sent.split("i=")
+        .skip(1)
+        .filter_map(|rest| {
+            let (id, after) = rest.split_once(',')?;
+            after.starts_with("a=T").then(|| id.parse().ok())?
         })
         .collect()
 }
@@ -972,9 +1079,9 @@ fn kitty_kept_off_screen() {
     let worktree = scratch.worktree();
     let mut frame = worktree.frame();
     frame.advance().expect("advance");
-    let view = pane.settled(&mut frame);
+    pane.settled(&mut frame);
     assert_eq!(
-        kitty_ids(&pane.draw(&view)).len(),
+        kitty_ids(&pane.sent()).len(),
         3,
         "three images were not sent"
     );
@@ -991,6 +1098,10 @@ fn kitty_kept_off_screen() {
         "",
         "an image off screen was deleted"
     );
+    assert!(
+        pane.pictures.uploads().1.is_empty(),
+        "an image written whole was stopped when it scrolled off"
+    );
     assert_eq!(
         pane.pictures.kept(),
         1,
@@ -1000,11 +1111,7 @@ fn kitty_kept_off_screen() {
     pane.scroll(&mut frame, -150);
     let back = pane.settled(&mut frame);
     let drawn = pane.draw(&back);
-    assert_eq!(
-        cells_with(&drawn, "\x1b_G"),
-        0,
-        "a picture that came back was sent again"
-    );
+    assert_eq!(pane.sent(), "", "a picture that came back was sent again");
     assert!(
         cells_with(&drawn, &PLACEHOLDER.to_string()) > 0,
         "the picture that came back is not placed"
@@ -1028,8 +1135,8 @@ fn kitty_deleted_on_leave() {
     let worktree = scratch.worktree();
     let mut frame = worktree.frame();
     frame.advance().expect("advance");
-    let view = pane.settled(&mut frame);
-    let sent = kitty_ids(&pane.draw(&view));
+    pane.settled(&mut frame);
+    let sent = kitty_ids(&pane.sent());
     assert_eq!(sent.len(), 3, "three images were not sent: {sent:?}");
 
     // The image is reverted, so its file leaves the diff.
@@ -1051,8 +1158,8 @@ fn kitty_deleted_on_edit() {
     let worktree = scratch.worktree();
     let mut frame = worktree.frame();
     frame.advance().expect("advance");
-    let view = pane.settled(&mut frame);
-    let sent = kitty_ids(&pane.draw(&view));
+    pane.settled(&mut frame);
+    let sent = kitty_ids(&pane.sent());
     assert_eq!(sent.len(), 3, "three images were not sent: {sent:?}");
     assert_eq!(
         pane.pictures.retired(),
@@ -1080,8 +1187,10 @@ fn kitty_deleted_on_edit() {
 
 #[test]
 fn protocol_hidden_under_sheet() {
+    // A Kitty image's cells are its placeholders; a Sixel image's, its escape.
+    let placeholder = PLACEHOLDER.to_string();
     for (protocol, sequence) in [
-        (ProtocolType::Kitty, "\x1b_G"),
+        (ProtocolType::Kitty, placeholder.as_str()),
         (ProtocolType::Sixel, "\x1bP"),
     ] {
         let (scratch, mut pane) = protocol_pane(&format!("pictures-sheet-{protocol:?}"), protocol);
@@ -1098,10 +1207,14 @@ fn protocol_hidden_under_sheet() {
             "a {protocol:?} image was drawn under the sheet, which cannot hide it"
         );
         let open = pane.draw(&view);
-        assert_eq!(
-            cells_with(&open, sequence),
-            3,
-            "the {protocol:?} images were not drawn once the sheet closed"
+        let drawn = cells_with(&open, sequence);
+        assert!(
+            if protocol == ProtocolType::Kitty {
+                drawn > 3
+            } else {
+                drawn == 3
+            },
+            "the {protocol:?} images were not drawn once the sheet closed: {drawn}"
         );
     }
 }
@@ -1147,8 +1260,8 @@ fn kitty_deleted_on_quit() {
     let worktree = scratch.worktree();
     let mut frame = worktree.frame();
     frame.advance().expect("advance");
-    let view = pane.settled(&mut frame);
-    let sent = kitty_ids(&pane.draw(&view));
+    pane.settled(&mut frame);
+    let sent = kitty_ids(&pane.sent());
     assert_eq!(sent.len(), 3, "three images were not sent: {sent:?}");
     pane.pictures.retire_all();
     let deletes = pane.pictures.retired();
@@ -1484,11 +1597,11 @@ fn kitty_resent_on_refresh() {
     let worktree = scratch.worktree();
     let mut frame = worktree.frame();
     frame.advance().expect("advance");
-    let view = pane.settled(&mut frame);
-    let mut sent = kitty_ids(&pane.draw(&view));
+    pane.settled(&mut frame);
+    let mut sent = kitty_ids(&pane.sent());
     assert_eq!(sent.len(), 3, "three images were not sent: {sent:?}");
     assert!(
-        kitty_ids(&pane.draw(&view)).is_empty(),
+        kitty_ids(&pane.sent()).is_empty(),
         "a second draw sent the images again"
     );
     let mut every: Vec<u32> = sent.clone();
@@ -1504,8 +1617,8 @@ fn kitty_resent_on_refresh() {
                 "press {press}: image {id} was not deleted once: {deletes:?}"
             );
         }
-        let view = pane.settled(&mut frame);
-        sent = kitty_ids(&pane.draw(&view));
+        pane.settled(&mut frame);
+        sent = kitty_ids(&pane.sent());
         assert_eq!(
             sent.len(),
             3,
