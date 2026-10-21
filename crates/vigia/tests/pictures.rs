@@ -2055,25 +2055,79 @@ fn picture_rows_display() {
 }
 
 #[test]
-fn thumb_ignores_pictures() {
-    // A screen that is mostly picture shows fewer rows of the diff than one of
-    // text, so its thumb is shorter.
+fn thumb_reaches_end() {
+    // Scrolled a row at a time over images in a row to the end: the thumb
+    // only moves down, and its bottom ends at the track's.
+    let scratch = Scratch::new("pictures-thumb-end");
+    scratch.write("a.txt", support::numbered_lines(40));
+    for name in ["b.png", "c.png", "d.png"] {
+        scratch.write(name, png(600, 1300, 1));
+    }
+    scratch.commit_all("baseline");
+    scratch.write("a.txt", support::numbered_lines(44));
+    for name in ["b.png", "c.png", "d.png"] {
+        scratch.write(name, png(600, 1300, 2));
+    }
+    let worktree = scratch.worktree();
+    let mut frame = worktree.frame();
+    frame.advance().expect("advance");
+    let mut pane = Pane::new(100, 30);
+    let mut reached = Vec::new();
+    let mut totals = std::collections::BTreeSet::new();
+    let mut last = None;
+    for _ in 0..400 {
+        let view = pane.settled(&mut frame);
+        let at = (
+            view.top,
+            view.bar_above() + view.bar_shown(),
+            view.bar_total(),
+        );
+        if last == Some(at) {
+            break;
+        }
+        totals.insert(at.2);
+        reached.push(at.1);
+        last = Some(at);
+        pane.scroll(&mut frame, 1);
+    }
+    assert!(
+        reached.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the thumb moved back while scrolling down: {reached:?}"
+    );
+    assert_eq!(
+        totals.len(),
+        1,
+        "the bar's total changed while scrolling, which moves the drawn thumb: {totals:?}"
+    );
+    let (_, bottom, total) = last.expect("a frame");
+    assert_eq!(
+        bottom, total,
+        "at the end the thumb stops short of the bottom"
+    );
+}
+
+#[test]
+fn thumb_steady() {
+    // Scrolled over a picture and the text after it, the thumb keeps one
+    // length: it is the screen's share of the diff, pictures counted.
     let (scratch, mut pane) = stacked("pictures-thumb", ProtocolType::Halfblocks, 30);
     let worktree = scratch.worktree();
     let mut frame = worktree.frame();
     frame.advance().expect("advance");
-    let view = pane.settled(&mut frame);
-    let pictured = thumb_length(&pane.draw(&view));
-    pane.scroll(&mut frame, 40);
-    let view = pane.settled(&mut frame);
+    let mut lengths = Vec::new();
+    let mut over_picture = false;
+    for _ in 0..12 {
+        let view = pane.settled(&mut frame);
+        over_picture |= !picture_rows(&view).is_empty();
+        lengths.push(thumb_length(&pane.draw(&view)));
+        pane.scroll(&mut frame, 6);
+    }
+    assert!(over_picture, "no screen held the picture");
+    let (least, most) = (lengths.iter().min(), lengths.iter().max());
     assert!(
-        picture_rows(&view).is_empty(),
-        "the picture is still on screen"
-    );
-    let text = thumb_length(&pane.draw(&view));
-    assert!(
-        pictured < text,
-        "the thumb over a picture is {pictured} rows, as long as over text ({text})"
+        most.zip(least)
+            .is_some_and(|(most, least)| most - least <= 1),
+        "the thumb changed length while scrolling: {lengths:?}"
     );
 }
 
