@@ -35,10 +35,10 @@ mod pdf {
 
 /// Columns between two panels.
 pub const GAP: u16 = 2;
-/// The narrowest a panel may be and still be drawn.
+/// The narrowest a picture scaled down may be and still be drawn.
 pub const MIN_WIDTH: u16 = 8;
-/// The shortest a panel may be and still be drawn.
-pub const MIN_ROWS: u16 = 6;
+/// The cell pictures are laid out at until the terminal's is known.
+pub const BEFORE_CELL: Cell = (10, 20);
 
 /// Which pictures a changed image draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,22 +121,23 @@ pub struct Shape {
     pub slots: Vec<Slot>,
 }
 
-/// An image's size in cells when fitted into `width` columns by `rows` rows. A
-/// half-block is two pixels in one cell, which is about square on screen.
-fn fit(side: &ImageSide, width: u16, rows: u16) -> (u16, u16) {
-    if side.width == 0 || side.height == 0 {
-        return (0, 0);
+/// An image's size in cells of `cell` device pixels: its own size, or scaled
+/// down to fit `width` columns by `rows` rows, keeping its aspect. `None` when
+/// it had to be scaled under [`MIN_WIDTH`] columns.
+fn fit(side: &ImageSide, width: u16, rows: u16, cell: Cell) -> Option<(u16, u16)> {
+    if side.width == 0 || side.height == 0 || width == 0 || rows == 0 || cell.0 == 0 || cell.1 == 0
+    {
+        return None;
     }
-    let scale = (f64::from(width) / f64::from(side.width))
-        .min(f64::from(rows) * 2.0 / f64::from(side.height));
-    let cells = (f64::from(side.width) * scale).floor() as u16;
-    let pixels = (f64::from(side.height) * scale).floor() as u16;
-    (cells.max(1), pixels.div_ceil(2).max(1))
-}
-
-/// Whether a fitted panel is big enough to draw.
-fn fits((width, rows): (u16, u16)) -> bool {
-    width >= MIN_WIDTH && rows >= MIN_ROWS
+    let (cell_width, cell_height) = (f64::from(cell.0), f64::from(cell.1));
+    let (image_width, image_height) = (f64::from(side.width), f64::from(side.height));
+    let scale = (f64::from(width) * cell_width / image_width)
+        .min(f64::from(rows) * cell_height / image_height)
+        .min(1.0);
+    // Clamped, since the side that binds can round a hair past the room.
+    let columns = ((image_width * scale / cell_width).ceil() as u16).clamp(1, width);
+    let tall = ((image_height * scale / cell_height).ceil() as u16).clamp(1, rows);
+    (scale >= 1.0 || columns >= MIN_WIDTH).then_some((columns, tall))
 }
 
 /// Panels of these fitted sizes laid out from the left, [`GAP`] apart.
@@ -157,9 +158,16 @@ fn row_of(kind: Kind, start: u16, sizes: &[(u16, u16)]) -> Shape {
     }
 }
 
-/// Where a changed image's pictures go in `width` columns and `rows` rows, or
-/// `None` when nothing fits or the terminal cannot draw a half-block's colours.
-pub fn shape(picture: &Picture, width: u16, rows: u16, truecolour: bool) -> Option<Shape> {
+/// Where a changed image's pictures go in `width` columns and `rows` rows of
+/// `cell` device pixels, or `None` when nothing fits or the terminal cannot
+/// draw a half-block's colours.
+pub fn shape(
+    picture: &Picture,
+    width: u16,
+    rows: u16,
+    cell: Cell,
+    truecolour: bool,
+) -> Option<Shape> {
     if !truecolour {
         return None;
     }
@@ -177,27 +185,24 @@ pub fn shape(picture: &Picture, width: u16, rows: u16, truecolour: bool) -> Opti
     }
     let third = width.saturating_sub(2 * GAP) / 3;
     let one = |kind: Kind, side: &ImageSide| {
-        // The bar takes the slot's first column.
-        let size = fit(side, third.saturating_sub(1), rows);
-        fits(size).then(|| row_of(kind, 1, &[size]))
+        // The bar takes the first column.
+        fit(side, width.saturating_sub(1), rows, cell).map(|size| row_of(kind, 1, &[size]))
     };
     match (&picture.before, &picture.after) {
         (Some(old), Some(new)) if (old.width, old.height) == (new.width, new.height) => {
-            let size = fit(new, third, rows);
-            if fits(size) {
+            if let Some(size) = fit(new, third, rows, cell) {
                 return Some(row_of(Kind::Three, 0, &[size, size, size]));
             }
-            let size = fit(new, width, rows);
-            fits(size).then(|| row_of(Kind::Mask, 0, &[size]))
+            fit(new, width, rows, cell).map(|size| row_of(Kind::Mask, 0, &[size]))
         }
         (Some(old), Some(new)) => {
             let half = width.saturating_sub(GAP) / 2;
-            let (left, right) = (fit(old, half, rows), fit(new, half, rows));
-            if fits(left) && fits(right) {
+            if let (Some(left), Some(right)) =
+                (fit(old, half, rows, cell), fit(new, half, rows, cell))
+            {
                 return Some(row_of(Kind::Pair, 0, &[left, right]));
             }
-            let size = fit(new, width, rows);
-            fits(size).then(|| row_of(Kind::New, 0, &[size]))
+            fit(new, width, rows, cell).map(|size| row_of(Kind::New, 0, &[size]))
         }
         (None, Some(new)) => one(Kind::Added, new),
         (Some(old), None) => one(Kind::Deleted, old),
@@ -558,6 +563,13 @@ pub type Cell = (u16, u16);
 /// reports it.
 pub type Window = ratatui::crossterm::terminal::WindowSize;
 
+/// Device pixels to a reported cell pixel: 2 on macOS when the cell was
+/// measured from the window's size, which is in logical points there, and not
+/// heard from the terminal.
+pub fn density(heard: bool, measured: bool, macos: bool) -> u16 {
+    if !heard && measured && macos { 2 } else { 1 }
+}
+
 /// The cell in `now`, from the cell `queried` in `then`, kept at `current`
 /// unless it moved further than the windows' leftover pixels can explain. `None` when either reports no
 /// pixels.
@@ -638,6 +650,8 @@ pub struct Pictures {
     cell: Option<Cell>,
     /// The cell the query found; `None` for half-blocks, whose grid is no cell's.
     queried: Option<Cell>,
+    /// Device pixels to a cell pixel, from [`density`].
+    density: u16,
     /// The window the cell was queried in, once told.
     queried_in: Option<Window>,
     /// How many images this cache's worker has decoded.
@@ -814,6 +828,7 @@ impl Pictures {
             picker: Some(picked),
             cell: None,
             queried: None,
+            density: 1,
             queried_in: None,
             decoded,
             found: Vec::new(),
@@ -902,6 +917,27 @@ impl Pictures {
         self.decoded.load(Ordering::Relaxed)
     }
 
+    /// Say how the terminal's cell size was found, before [`Pictures::pick`]:
+    /// one measured from the window on macOS is in logical points, and pictures
+    /// are sized and encoded at twice them.
+    pub fn cell_reported(&mut self, heard: bool, measured: bool) {
+        self.density = density(heard, measured, cfg!(target_os = "macos"));
+    }
+
+    /// The cell pictures are sized at, in device pixels.
+    pub fn device_cell(&self) -> Cell {
+        self.scaled(self.cell.unwrap_or(BEFORE_CELL))
+    }
+
+    /// The device cell pictures are built at, once the picker is given.
+    fn built_cell(&self) -> Option<Cell> {
+        self.cell.map(|cell| self.scaled(cell))
+    }
+
+    fn scaled(&self, (width, height): Cell) -> Cell {
+        (width * self.density, height * self.density)
+    }
+
     /// Say how pictures are encoded, which starts the held jobs. Once only.
     pub fn pick(&mut self, picker: Picker) {
         if let Some(picked) = self.picker.take() {
@@ -910,6 +946,13 @@ impl Pictures {
             self.cell = Some(cell);
             let protocol = picker.protocol_type() != ProtocolType::Halfblocks;
             self.queried = protocol.then_some(cell);
+            // Jobs queued before the cell was known are for a layout that is
+            // not drawn: dropped as off screen, and the next frame asks again.
+            if self.device_cell() != BEFORE_CELL
+                && let Ok(mut shown) = self.shown.lock()
+            {
+                shown.clear();
+            }
             let _ = picked.send(picker);
         }
     }
@@ -1109,8 +1152,8 @@ impl Pictures {
         while let Ok((key, cell, built)) = self.done.try_recv() {
             self.pending.remove(&key);
             // Built at a cell the window has since left: asked for again.
-            let at = cell.or(self.queried);
-            if at.is_some() && at != self.cell {
+            let at = cell.or(self.queried.map(|queried| self.scaled(queried)));
+            if at.is_some() && at != self.built_cell() {
                 self.retired
                     .extend(built.iter().flat_map(|built| built.kitty.iter()));
                 continue;
@@ -1188,7 +1231,7 @@ impl Pictures {
                     picture.before.map(|side| side.format),
                     picture.after.map(|side| side.format),
                 ),
-                cell: self.cell,
+                cell: self.built_cell(),
             };
             if self.jobs.send(job).is_ok() {
                 self.pending.insert(Arc::clone(key));
@@ -1623,9 +1666,18 @@ fn render_svg(tree: &resvg::usvg::Tree, long: f32) -> Option<RgbaImage> {
     RgbaImage::from_raw(width, height, pixmap.take_demultiplied())
 }
 
-/// Each side of a changed SVG rendered at one long side, so the two compare,
-/// or `None` when either cannot be drawn.
-fn svg_sides(job: &Job) -> Option<(Option<Decoded>, Option<Decoded>)> {
+/// A changed SVG's sides, kept to be drawn again at each panel's size.
+struct SvgDrawn {
+    old: Option<resvg::usvg::Tree>,
+    new: Option<resvg::usvg::Tree>,
+    /// The longest side the filter budget lets either render at.
+    long: f32,
+}
+
+/// Each side of a changed SVG rendered at its own size, no larger than the
+/// filter budget allows, so the two compare at the document's pixels, or
+/// `None` when either cannot be drawn.
+fn svg_sides(job: &Job) -> Option<(Option<Decoded>, Option<Decoded>, SvgDrawn)> {
     let tree = |source: &Option<Source>| match source {
         Some(source) => svg_tree(&read_counted(source)?).map(Some),
         None => Some(None),
@@ -1637,11 +1689,14 @@ fn svg_sides(job: &Job) -> Option<(Option<Decoded>, Option<Decoded>)> {
         .map(|tree| (prices(tree), tree.size().width().max(tree.size().height())))
         .collect();
     let long = long_side(&sides)?;
-    let render = |tree: Option<resvg::usvg::Tree>| match tree {
-        Some(tree) => render_svg(&tree, long).map(|image| Some((image, None))),
+    let own = sides.iter().map(|(_, size)| *size).fold(1.0_f32, f32::max);
+    let compared = long.min(own.ceil());
+    let render = |tree: &Option<resvg::usvg::Tree>| match tree {
+        Some(tree) => render_svg(tree, compared).map(|image| Some((image, None))),
         None => Some(None),
     };
-    Some((render(old)?, render(new)?))
+    let (before, after) = (render(&old)?, render(&new)?);
+    Some((before, after, SvgDrawn { old, new, long }))
 }
 
 /// What the worker draws of a changed PDF.
@@ -1812,7 +1867,7 @@ fn pixels_of(slot: Slot, (width, height): (u32, u32), picker: &Picker) -> (u32, 
     }
 }
 
-/// Which cells of a half-block grid `width` by `height` changed.
+/// Which pixels of a grid `width` by `height` changed.
 struct Hits {
     cells: Vec<bool>,
     width: u32,
@@ -1877,9 +1932,12 @@ fn build(job: &Job, inks: Inks, picker: &Picker, compress: bool) -> Built {
     if vector(Format::Pdf) && job.key.shape.slots.is_empty() {
         return pdf::sized(job);
     }
-    let (mut page, mut alone) = (None, None);
+    let (mut page, mut alone, mut vectors) = (None, None, None);
     let sides = if vector(Format::Svg) {
-        svg_sides(job)
+        svg_sides(job).map(|(old, new, drawn)| {
+            vectors = Some(drawn);
+            (old, new)
+        })
     } else if vector(Format::Pdf) {
         pdf::drawn(job).map(|drawn| {
             (page, alone) = (drawn.note, drawn.alone);
@@ -1941,10 +1999,41 @@ fn build(job: &Job, inks: Inks, picker: &Picker, compress: bool) -> Built {
         let Some(image) = image else {
             return undecoded();
         };
+        let tree = vectors.as_ref().and_then(|drawn| match side {
+            Side::Old => drawn.old.as_ref().map(|tree| (tree, drawn.long)),
+            Side::New => drawn.new.as_ref().map(|tree| (tree, drawn.long)),
+        });
         let to = pixels_of(slot, image.dimensions(), picker);
+        // A slot is whole cells, so its pixels can exceed the picture's: a
+        // raster is drawn at its own pixels rather than enlarged to them.
+        let to = if tree.is_none()
+            && picker.protocol_type() != ProtocolType::Halfblocks
+            && to.0 > image.width()
+        {
+            image.dimensions()
+        } else {
+            to
+        };
         let small = shrunk
             .entry((side, to.0, to.1))
             .or_insert_with(|| {
+                // An SVG is drawn again at the panel's pixels, so it is sharp
+                // at the size it is shown.
+                if let Some((tree, long)) = tree
+                    && to != image.dimensions()
+                    && let Some(mut drawn) = render_svg(tree, long.min(to.0.max(to.1) as f32))
+                {
+                    if drawn.dimensions() != to {
+                        drawn = image::imageops::resize(
+                            &drawn,
+                            to.0,
+                            to.1,
+                            image::imageops::FilterType::Triangle,
+                        );
+                    }
+                    flatten(&mut drawn, inks.canvas);
+                    return DynamicImage::ImageRgba8(drawn).to_rgb8();
+                }
                 // Averaged on the way down; kept sharp on the way up, so an icon
                 // smaller than its panel stays a picture of pixels.
                 let filter = if to.0 < image.width() {
@@ -1958,7 +2047,9 @@ fn build(job: &Job, inks: Inks, picker: &Picker, compress: bool) -> Built {
             .clone();
         let hit = match (paint, &mask) {
             (Paint::Mask, Some(mask)) => {
-                let grid = grid_of(slot);
+                // At the panel's own pixels, pooled where they are fewer than
+                // the picture's, so a change is marked as finely as it is drawn.
+                let grid = (to.0.min(image.width()), to.1.min(image.height()));
                 Some(Hits {
                     cells: shrink_mask(mask, image.dimensions(), grid),
                     width: grid.0,
@@ -2563,6 +2654,9 @@ mod tests {
         }
     }
 
+    /// A cell of 10x20 pixels.
+    const CELL: Cell = (10, 20);
+
     fn both(width: u32, height: u32) -> Picture {
         Picture {
             before: Some(side(width, height)),
@@ -2571,8 +2665,83 @@ mod tests {
     }
 
     #[test]
+    fn natural_size() {
+        // A 24x24 icon at a reported 16x32 cell takes 2x1 cells however much
+        // room there is: never enlarged.
+        let added = |width, height| Picture {
+            before: None,
+            after: Some(side(width, height)),
+        };
+        let icon = shape(&added(24, 24), 200, 60, (16, 32), true).expect("a shape");
+        assert_eq!((icon.slots[0].width, icon.slots[0].rows), (2, 1));
+        // The same icon where only the window's logical size is known, on
+        // macOS: the device cell is twice it, so the icon is the same size.
+        let unheard = (
+            8 * density(false, true, true),
+            16 * density(false, true, true),
+        );
+        let same = shape(&added(24, 24), 200, 60, unheard, true).expect("a shape");
+        assert_eq!(same.slots, icon.slots);
+        // A full-screen snapshot beside it fills the height it is given.
+        let snapshot = shape(&added(1170, 2532), 200, 60, (16, 32), true).expect("a shape");
+        assert_eq!(snapshot.rows, 60);
+        assert!(snapshot.slots[0].width > 10 * icon.slots[0].width);
+    }
+
+    #[test]
+    fn wide_short_fits() {
+        // A deleted 1070x198 screenshot in half a laptop screen, 104 columns
+        // at a 16x32 cell: drawn across the width rather than hidden.
+        let deleted = Picture {
+            before: Some(side(1070, 198)),
+            after: None,
+        };
+        let half = shape(&deleted, 104, 40, (16, 32), true).expect("a picture");
+        assert_eq!(half.kind, Kind::Deleted);
+        let slot = half.slots[0];
+        assert_eq!((slot.x, slot.width), (1, 67), "{slot:?}");
+        // Narrower than its own size: scaled down to the width there is.
+        let narrow = shape(&deleted, 40, 40, (16, 32), true).expect("a picture");
+        assert_eq!(narrow.slots[0].width, 39);
+        assert_eq!(narrow.slots[0].rows, 4);
+    }
+
+    #[test]
+    fn small_unscaled_drawn() {
+        // Scaled down under 8 columns: too small to read. At its own size
+        // under 8 columns: drawn.
+        let added = |width, height| Picture {
+            before: None,
+            after: Some(side(width, height)),
+        };
+        assert_eq!(shape(&added(2000, 2000), 40, 3, CELL, true), None);
+        assert!(shape(&added(24, 24), 40, 3, CELL, true).is_some());
+    }
+
+    #[test]
+    fn retina_density() {
+        assert_eq!(
+            density(true, true, true),
+            1,
+            "a reported cell is device pixels"
+        );
+        assert_eq!(
+            density(false, true, true),
+            2,
+            "macOS's window size is in points"
+        );
+        assert_eq!(
+            density(false, false, true),
+            1,
+            "a guessed cell is not doubled"
+        );
+        assert_eq!(density(false, true, false), 1);
+        assert_eq!(density(true, true, false), 1);
+    }
+
+    #[test]
     fn three_panels() {
-        let shape = shape(&both(1242, 2688), 76, 19, true).expect("a shape");
+        let shape = shape(&both(1242, 2688), 76, 19, CELL, true).expect("a shape");
         assert_eq!(shape.kind, Kind::Three);
         assert_eq!(shape.slots.len(), 3);
         let first = shape.slots[0];
@@ -2581,24 +2750,25 @@ mod tests {
             first.width + GAP,
             "panels are not two columns apart"
         );
-        assert!(first.width >= MIN_WIDTH && first.rows >= MIN_ROWS);
+        assert!(first.width >= MIN_WIDTH);
     }
 
     #[test]
     fn mask_alone_narrow() {
-        let shape = shape(&both(2000, 800), 60, 19, true).expect("a shape");
+        // A third is under 8 columns, so the mask takes the width.
+        let shape = shape(&both(2000, 800), 26, 19, CELL, true).expect("a shape");
         assert_eq!(shape.kind, Kind::Mask);
         assert_eq!(shape.slots.len(), 1);
     }
 
     #[test]
     fn no_picture_short() {
-        assert_eq!(shape(&both(1242, 2688), 76, 5, true), None);
+        assert_eq!(shape(&both(1242, 2688), 76, 5, CELL, true), None);
     }
 
     #[test]
     fn no_picture_below_truecolour() {
-        assert_eq!(shape(&both(1242, 2688), 120, 40, false), None);
+        assert_eq!(shape(&both(1242, 2688), 120, 40, CELL, false), None);
     }
 
     #[test]
@@ -2607,7 +2777,7 @@ mod tests {
             before: None,
             after: Some(side(1242, 2688)),
         };
-        let shape_added = shape(&added, 76, 19, true).expect("a shape");
+        let shape_added = shape(&added, 76, 19, CELL, true).expect("a shape");
         assert_eq!(
             (shape_added.kind, shape_added.slots.len()),
             (Kind::Added, 1)
@@ -2616,17 +2786,17 @@ mod tests {
             shape_added.slots[0].x, 1,
             "the bar does not have the first column"
         );
-        let three = shape(&both(1242, 2688), 76, 19, true).expect("a shape");
+        let three = shape(&both(1242, 2688), 76, 19, CELL, true).expect("a shape");
         assert!(
-            shape_added.slots[0].width <= three.slots[0].width,
-            "an added picture is wider than a three-panel one"
+            shape_added.slots[0].width >= three.slots[0].width,
+            "an added picture has less room than one of three"
         );
         let deleted = Picture {
             before: Some(side(1242, 2688)),
             after: None,
         };
         assert_eq!(
-            shape(&deleted, 76, 19, true).map(|shape| shape.kind),
+            shape(&deleted, 76, 19, CELL, true).map(|shape| shape.kind),
             Some(Kind::Deleted)
         );
     }
@@ -2638,7 +2808,7 @@ mod tests {
             after: Some(side(1179, 2556)),
         };
         assert_eq!(
-            shape(&picture, 76, 19, true).map(|shape| shape.kind),
+            shape(&picture, 76, 19, CELL, true).map(|shape| shape.kind),
             Some(Kind::Pair)
         );
     }

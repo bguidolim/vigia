@@ -485,10 +485,10 @@ fn picture_at_end_reachable() {
 #[test]
 fn picture_partly_off() {
     let scratch = Scratch::new("pictures-partly");
-    scratch.write("a.png", png(120, 260, 1));
+    scratch.write("a.png", png(1200, 2600, 1));
     scratch.write("z.txt", support::numbered_lines(10));
     scratch.commit_all("baseline");
-    scratch.write("a.png", png(120, 260, 2));
+    scratch.write("a.png", png(1200, 2600, 2));
     scratch.write("z.txt", support::numbered_lines(13));
     let worktree = scratch.worktree();
     let mut frame = worktree.frame();
@@ -824,8 +824,9 @@ fn protocol_pane(name: &str, protocol: ProtocolType) -> (Scratch, Pane) {
     let scratch = changed(
         name,
         "screen.png",
-        &encode(&screen_like(120, 260, [40, 90, 200]), ImageFormat::Png),
-        &encode(&screen_like(120, 260, [200, 90, 40]), ImageFormat::Png),
+        // Larger than the pane at either cell, so it is scaled to the room.
+        &encode(&screen_like(600, 1300, [40, 90, 200]), ImageFormat::Png),
+        &encode(&screen_like(600, 1300, [200, 90, 40]), ImageFormat::Png),
     );
     (scratch, Pane::drawn_by(100, 30, protocol))
 }
@@ -1021,10 +1022,10 @@ fn screen_order() {
 #[test]
 fn scrolled_kitty_placement() {
     let scratch = Scratch::new("pictures-kitty-scrolled");
-    scratch.write("a.png", png(120, 260, 1));
+    scratch.write("a.png", png(1200, 2600, 1));
     scratch.write("z.txt", support::numbered_lines(10));
     scratch.commit_all("baseline");
-    scratch.write("a.png", png(120, 260, 2));
+    scratch.write("a.png", png(1200, 2600, 2));
     scratch.write("z.txt", support::numbered_lines(13));
     let mut pane = Pane::drawn_by(100, 30, ProtocolType::Kitty);
     let worktree = scratch.worktree();
