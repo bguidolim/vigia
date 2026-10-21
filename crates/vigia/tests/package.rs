@@ -3255,14 +3255,17 @@ fn the_spec_quotes_the_sheets_purpose_lines() {
 
 /// Direct dependencies that the `Built with` table in `docs/ARCHITECTURE.md`
 /// leaves out on purpose.
-const NOT_DOCUMENTED: [&str; 8] = [
+const NOT_DOCUMENTED: [&str; 10] = [
     "libc",
     "rustix",
     "rustls-graviola",
     "serde_json",
     "signal-hook",
     "ureq",
-    // The `syntect` row, under the name the fork is published as.
+    // The `hayro`, `hayro-syntax` and `syntect` rows, under the names their
+    // forks are published as.
+    "vigia-hayro",
+    "vigia-hayro-syntax",
     "vigia-syntect",
     "windows-sys",
 ];
@@ -3814,6 +3817,70 @@ fn forks_replace_crates() {
         )),
         "vigia-core's syntect-upstream is not the {version} the fork is cut from"
     );
+}
+
+/// CI formats the workspace members by name, since `--all` reaches the forks
+/// under `vendor/`; the names must be every member.
+#[test]
+fn fmt_names_members() {
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ])
+        .current_dir(repo_root())
+        .output()
+        .expect("cargo runs");
+    assert!(output.status.success(), "`cargo metadata` failed");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo metadata answers JSON");
+    let members: BTreeSet<&str> = metadata["packages"]
+        .as_array()
+        .expect("metadata lists packages")
+        .iter()
+        .map(|package| package["name"].as_str().expect("a name"))
+        .collect();
+    for file in [".github/workflows/ci.yml", "CONTRIBUTING.md"] {
+        let text = repo_file(file);
+        let line = text
+            .lines()
+            .find(|line| line.contains("cargo fmt -p"))
+            .unwrap_or_else(|| panic!("{file} formats no member by name"));
+        let named: BTreeSet<&str> = line
+            .split_whitespace()
+            .skip_while(|word| *word != "fmt")
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|pair| pair[0] == "-p")
+            .map(|pair| pair[1])
+            .collect();
+        assert_eq!(named, members, "{file} does not format exactly the members");
+        assert!(
+            !text.contains("cargo fmt --all"),
+            "{file} runs `cargo fmt --all`, which reformats the forks under vendor/"
+        );
+    }
+}
+
+/// The workspace patches no crate: a `[patch]` reaches a checkout and never a
+/// crates.io build, so a fix carried that way ships to half the installs.
+#[test]
+fn no_patch_section() {
+    for file in ["Cargo.toml", ".cargo/config.toml", ".cargo/config"] {
+        let Ok(text) = std::fs::read_to_string(repo_root().join(file)) else {
+            continue;
+        };
+        assert!(
+            !text
+                .lines()
+                .map(str::trim_start)
+                .any(|line| { line.starts_with("[patch") || line.starts_with("patch.") }),
+            "{file} takes a patch; publish the fix as a vendor/ fork instead"
+        );
+    }
 }
 
 /// A vendored crate built on its own leaves its build output beside it, and
