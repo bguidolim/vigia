@@ -4,6 +4,10 @@ Every released version of `vigia`, newest first. The date is the day the release
 
 Each version lists the pull requests labelled `release`, one line each: what the pane shows or does, a key or gesture, a theme, installation, or the MCP tools. Internal work such as CI, tests and documentation is not listed.
 
+## [1.2.2] - 2026-10-21
+
+- The scrollbar's thumb keeps one length while you scroll over pictures.
+
 ## [1.2.1] - 2026-10-21
 
 - Pictures draw at their true size, shrink to fit a narrow pane instead of disappearing, and are sharp on a Retina Mac whose terminal does not report its cell size.
