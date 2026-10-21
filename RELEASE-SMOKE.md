@@ -85,7 +85,7 @@ Three kills are deliberately **not** boxes here. `kill -9` and `taskkill /F` are
 
 ### Pictures and notes
 
-These run on the release build: `cargo build --release -p vigia --features pdf`, then `target/release/vigia`. A build without `pdf` shows a changed PDF as binary. The scene bed is described in [CONTRIBUTING.md, under Running things](CONTRIBUTING.md#running-things).
+These run on the release build: `cargo build --release -p vigia`, then `target/release/vigia`. The scene bed is described in [CONTRIBUTING.md, under Running things](CONTRIBUTING.md#running-things).
 
 - [ ] **Every picture state.** `cargo run -p xtask --bin scene -- static` prints a `vigia <path>` line and one line per file. Run the release binary on that path in another pane and check each file against the printed list: images side by side with the changed pixels marked, an SVG as pictures, a PDF's first changed page, a renamed and edited image as a rename with both pictures, and an LFS image with no object as a size line. On kitty or Ghostty the pixels are sharp; if they are half-blocks, rerun with `VIGIA_PICTURES=kitty` and record which you got.
 - [ ] **The scrollbar with pictures.** With pictures on screen, the thumb's length matches how much of the content is visible, and at the bottom of the scroll the thumb reaches the bottom.
@@ -111,7 +111,7 @@ The publish is a CI job now, so these steps make sure that the publish is correc
 - [ ] The `Release` workflow is green end to end, including
 `custom-publish-crates-io`. **Read that job specifically and not the overall tick.** The GitHub release is created in `host`, before the registry job runs and with no `--draft`, so public binaries prove nothing about crates.io. A green `announce` does not prove it either: that job is a checkout.
 - [ ] `cargo install vigia` from crates.io, on one machine that has never built
-this repo. This is the true cold path.
+this repo, and a changed PDF draws pictures in it. This is the true cold path.
 - [ ] If the registry job failed while the release went public, that is the
 documented half-failure. **The recovery depends on how far the job got, and a re-run of the job is right for only one of the two cases**, because publishing a version that is already published is an error and not a silent no-op:
       - Nothing was accepted: re-run the job.
