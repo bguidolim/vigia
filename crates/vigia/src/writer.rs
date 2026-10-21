@@ -79,6 +79,9 @@ pub struct Upload {
     pub ticket: crate::kitty::Ticket,
 }
 
+/// How long uploads may wait behind frames before the oldest shares their turns.
+const STARVED: Duration = Duration::from_secs(1);
+
 /// The longest one wait for room to write lasts, so a stop is noticed this soon.
 const POLL: Duration = Duration::from_millis(50);
 
@@ -152,6 +155,13 @@ impl Shared {
     }
 }
 
+impl Upload {
+    /// How far into `data` its first `sent` chunks reach.
+    fn written_to(&self, sent: usize) -> usize {
+        sent.checked_sub(1).map_or(0, |last| self.ends[last])
+    }
+}
+
 /// What the writer's queue carries.
 enum Job {
     /// A frame's bytes: text, written ahead of any graphics waiting.
@@ -168,8 +178,8 @@ enum Job {
 
 /// One entry of the graphics lane.
 enum Graphic {
-    /// An upload and how many of its chunks are written.
-    Upload(Upload, usize),
+    /// An upload, how many of its chunks are written, and when it was queued.
+    Upload(Upload, usize, Instant),
     /// The close of an upload cut off, which stays the open image until written.
     Close(Vec<u8>),
     /// Bytes written whole.
@@ -183,6 +193,10 @@ struct Lanes {
     graphics: VecDeque<Graphic>,
     /// `stop` asked for the end: what is written next is all there is.
     stopping: bool,
+    /// Since when a frame has gone ahead of a waiting upload.
+    starved_since: Option<Instant>,
+    /// Past the cap, the next turn is an upload chunk's.
+    chunk_owed: bool,
 }
 
 impl Lanes {
@@ -190,16 +204,42 @@ impl Lanes {
         self.text.is_empty() && self.graphics.is_empty()
     }
 
+    fn clear_starvation(&mut self) {
+        self.starved_since = None;
+        self.chunk_owed = false;
+    }
+
+    /// Whether an upload waits.
+    fn waiting(&self) -> bool {
+        self.oldest().is_some()
+    }
+
+    /// The id of the upload queued longest.
+    fn oldest(&self) -> Option<u32> {
+        self.graphics.iter().find_map(|graphic| match graphic {
+            Graphic::Upload(upload, ..) => Some(upload.id),
+            _ => None,
+        })
+    }
+
     fn take(&mut self, job: Job) {
         match job {
             Job::Frame(bytes) => self.text.push_back(bytes),
             Job::Upload(upload) if !self.stopping && !upload.ends.is_empty() => {
-                self.graphics.push_back(Graphic::Upload(upload, 0));
+                self.graphics
+                    .push_back(Graphic::Upload(upload, 0, Instant::now()));
             }
             Job::Upload(_) => {}
             Job::Delete { id, bytes } => {
                 self.cancel(|of| of == id);
-                self.graphics.push_back(Graphic::Raw(bytes));
+                // Ahead of the uploads not yet begun, so a picture that left
+                // the screen waits for the image open at most.
+                let at = self
+                    .graphics
+                    .iter()
+                    .position(|graphic| matches!(graphic, Graphic::Upload(_, 0, _)))
+                    .unwrap_or(self.graphics.len());
+                self.graphics.insert(at, Graphic::Raw(bytes));
             }
             Job::Stop => {
                 self.stopping = true;
@@ -210,8 +250,9 @@ impl Lanes {
 
     /// Drop the uploads `which` names; one part sent is closed in its place.
     fn cancel(&mut self, which: impl Fn(u32) -> bool) {
+        let timed = self.oldest().is_some_and(&which);
         self.graphics.retain_mut(|graphic| {
-            let Graphic::Upload(upload, sent) = graphic else {
+            let Graphic::Upload(upload, sent, _) = graphic else {
                 return true;
             };
             if !which(upload.id) {
@@ -224,6 +265,18 @@ impl Lanes {
             *graphic = Graphic::Close(close);
             true
         });
+        if timed {
+            // The clock timed the oldest: the next has waited since it was
+            // queued, or since the clock started if it was queued before.
+            let queued = self.graphics.iter().find_map(|graphic| match graphic {
+                Graphic::Upload(_, _, queued) => Some(*queued),
+                _ => None,
+            });
+            match (queued, self.starved_since) {
+                (Some(queued), Some(since)) => self.starved_since = Some(since.max(queued)),
+                _ => self.clear_starvation(),
+            }
+        }
     }
 
     /// Write the next thing due: a frame, else one graphics chunk whole.
@@ -234,9 +287,23 @@ impl Lanes {
         shared: &Shared,
         wakes: &Wakes,
     ) -> io::Result<bool> {
-        if let Some(frame) = self.text.pop_front() {
+        if self.starved_since.is_some() && !self.waiting() {
+            // Cancelled or stopped since: the next to wait starts afresh.
+            self.clear_starvation();
+        }
+        // Past the cap, the upload waiting longest takes every other turn
+        // until it is done, so it moves while a frame waits one chunk at most.
+        let starved = self
+            .starved_since
+            .is_some_and(|since| since.elapsed() >= STARVED);
+        let chunk_turn = starved && std::mem::take(&mut self.chunk_owed);
+        if !chunk_turn && let Some(frame) = self.text.pop_front() {
+            if self.starved_since.is_none() && self.waiting() {
+                self.starved_since = Some(Instant::now());
+            }
+            self.chunk_owed = starved;
             write_out(out, &frame, shared, &mut |written| {
-                shared.wrote(written, wakes)
+                shared.wrote(written, wakes);
             })?;
             return Ok(true);
         }
@@ -255,18 +322,23 @@ impl Lanes {
                 }
                 self.graphics.pop_front();
             }
-            Graphic::Upload(upload, sent) => {
+            Graphic::Upload(upload, sent, _) => {
                 if *sent == 0 {
                     let bits = image_bits(upload.id, upload.tmux);
                     OPEN.store(bits, Ordering::SeqCst);
                     let slot = SENT_NEXT.fetch_add(1, Ordering::AcqRel) % SENT.len();
                     SENT[slot].store(bits, Ordering::Release);
                 }
-                let from = sent.checked_sub(1).map_or(0, |last| upload.ends[last]);
+                let from = upload.written_to(*sent);
                 let to = upload.ends[*sent];
                 write_out(out, &upload.data.as_bytes()[from..to], shared, &mut |_| {})?;
+                if !chunk_turn {
+                    // It moved in a gap between frames, so it was not starved.
+                    (self.starved_since, self.chunk_owed) = (None, false);
+                }
                 *sent += 1;
                 if *sent == upload.ends.len() && !shared.stopping() {
+                    (self.starved_since, self.chunk_owed) = (None, false);
                     OPEN.store(0, Ordering::SeqCst);
                     upload.ticket.written();
                     // A redraw, so its cells are drawn.
@@ -919,8 +991,8 @@ mod tests {
     #[test]
     fn lane_order() {
         // Text first; a chunk written whole; text only between chunks; a
-        // delete queued behind an image after its last chunk; the upload
-        // reported once whole.
+        // delete queued while an image is open after its last chunk; the
+        // upload reported once whole.
         let out = Taken::default();
         let (tx, rx) = mpsc::channel();
         let writer = Writer::start(
@@ -944,10 +1016,11 @@ mod tests {
         sink.write_all(b"<frame1>").expect("write");
         sink.flush().expect("flush");
         sink.upload(upload).expect("upload");
-        sink.delete(8, b"<delete>".to_vec()).expect("delete");
         // Room for the frame and the first chunk, then none: the second chunk waits.
         out.room.store(8 + first, Ordering::Release);
         taken_len(&out, 8 + first);
+        // Once the image is open: the delete waits for its last chunk.
+        sink.delete(8, b"<delete>".to_vec()).expect("delete");
         sink.write_all(b"<frame2>").expect("write");
         sink.flush().expect("flush");
         std::thread::sleep(Duration::from_millis(20));
@@ -1076,6 +1149,228 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(2)),
             Ok(()),
             "the whole upload was not reported"
+        );
+    }
+
+    /// An upload of `count` chunks of `size` bytes each.
+    fn big_upload(id: u32, count: usize, size: usize) -> (Upload, impl Fn() -> bool) {
+        let chunk = format!("\x1b_Gi={id},m=1;{}\x1b\\", "u".repeat(size));
+        let (ticket, held) = crate::kitty::ticket();
+        (
+            Upload {
+                id,
+                data: chunk.repeat(count).into(),
+                ends: (1..=count).map(|i| i * chunk.len()).collect(),
+                close: "".into(),
+                tmux: false,
+                ticket,
+            },
+            held,
+        )
+    }
+
+    /// The writer's side of a sink, driven a turn at a time.
+    struct Turns {
+        out: Taken,
+        shared: Shared,
+        wakes: Wakes,
+    }
+
+    impl Turns {
+        fn new() -> Self {
+            let out = Taken::default();
+            out.room.store(usize::MAX, Ordering::Release);
+            Turns {
+                out,
+                shared: Shared::default(),
+                wakes: Wakes::none(),
+            }
+        }
+
+        /// Up to `most` turns with a frame always waiting, until `done`. How
+        /// many it took.
+        fn run(&mut self, lanes: &mut Lanes, done: impl Fn() -> bool, most: usize) -> usize {
+            let mut turns = 0;
+            while !done() && turns < most {
+                self.frame(lanes);
+                lanes
+                    .write_next(&mut self.out, &self.shared, &self.wakes)
+                    .expect("a turn");
+                turns += 1;
+            }
+            turns
+        }
+
+        /// A frame queued, counted as a sink counts it on the way in.
+        fn frame(&self, lanes: &mut Lanes) {
+            self.shared
+                .unwritten
+                .fetch_add(b"<frame>".len(), Ordering::AcqRel);
+            lanes.take(Job::Frame(b"<frame>".to_vec()));
+        }
+    }
+
+    /// The clock, and every upload queued, past the cap.
+    fn starve(lanes: &mut Lanes) {
+        let past = Instant::now()
+            .checked_sub(STARVED * 2)
+            .expect("a clock that began before the cap");
+        lanes.starved_since = Some(past);
+        for graphic in &mut lanes.graphics {
+            if let Graphic::Upload(_, _, queued) = graphic {
+                *queued = past;
+            }
+        }
+    }
+
+    #[test]
+    fn starvation_cap() {
+        // A frame always waiting, past the cap: the upload and the frames take
+        // turns, so its five chunks go in exactly ten.
+        let mut lanes = Lanes::default();
+        let (upload, held) = big_upload(21, 5, 100);
+        lanes.take(Job::Upload(upload));
+        starve(&mut lanes);
+        let turns = Turns::new().run(&mut lanes, &held, 40);
+        assert!(
+            held(),
+            "frames always waiting and the upload never finished"
+        );
+        assert_eq!(turns, 10, "five chunks past the cap, every other turn");
+    }
+
+    #[test]
+    fn promoted_cancelled() {
+        // Past the cap, the upload taking turns is deleted: the frames go on,
+        // and the upload never finishes.
+        let mut lanes = Lanes::default();
+        let (upload, held) = big_upload(41, 5, 100);
+        lanes.take(Job::Upload(upload));
+        starve(&mut lanes);
+        let mut turns = Turns::new();
+        turns.run(&mut lanes, || false, 4);
+        lanes.take(Job::Delete {
+            id: 41,
+            bytes: b"<delete>".to_vec(),
+        });
+        assert_eq!(turns.run(&mut lanes, || false, 20), 20);
+        assert!(!held(), "a deleted upload was finished");
+    }
+
+    #[test]
+    fn clock_restarts() {
+        // A frame goes ahead of a waiting upload and arms the clock; a chunk
+        // that then goes in a gap between frames was not starved, and clears it.
+        let out = Taken::default();
+        out.room.store(usize::MAX, Ordering::Release);
+        let mut out = out;
+        let shared = Shared::default();
+        let wakes = Wakes::none();
+        let mut lanes = Lanes::default();
+        let (upload, _) = big_upload(51, 3, 100);
+        // As a sink counts them on the way in.
+        shared.unwritten.store(b"<frame>".len(), Ordering::Release);
+        lanes.take(Job::Upload(upload));
+        lanes.take(Job::Frame(b"<frame>".to_vec()));
+        lanes
+            .write_next(&mut out, &shared, &wakes)
+            .expect("the frame");
+        assert!(
+            lanes.starved_since.is_some(),
+            "a frame ahead of a waiting upload did not arm the clock"
+        );
+        lanes
+            .write_next(&mut out, &shared, &wakes)
+            .expect("a chunk");
+        assert!(
+            lanes.starved_since.is_none(),
+            "an upload that moved was still counted as starved"
+        );
+    }
+
+    #[test]
+    fn cancel_restarts() {
+        // The oldest upload, timed, is cancelled: the next has waited since it
+        // was queued, or since the clock started if it was queued before.
+        for queued_after in [false, true] {
+            let mut lanes = Lanes::default();
+            let mut turns = Turns::new();
+            let (first, _) = big_upload(52, 3, 100);
+            let (second, _) = big_upload(53, 3, 100);
+            lanes.take(Job::Upload(first));
+            if !queued_after {
+                lanes.take(Job::Upload(second));
+                turns.run(&mut lanes, || false, 1);
+            } else {
+                turns.run(&mut lanes, || false, 1);
+                std::thread::sleep(Duration::from_millis(5));
+                lanes.take(Job::Upload(second));
+            }
+            let armed = lanes.starved_since.expect("the frame armed the clock");
+            lanes.take(Job::Delete {
+                id: 52,
+                bytes: b"<delete>".to_vec(),
+            });
+            let since = lanes.starved_since.expect("an upload still waits");
+            if queued_after {
+                assert!(
+                    since > armed,
+                    "the upload queued later inherited the wait before it"
+                );
+            } else {
+                assert_eq!(since, armed, "the upload queued before lost its wait");
+            }
+        }
+    }
+
+    #[test]
+    fn delete_jumps() {
+        // A delete goes after the image open, not behind the uploads waiting:
+        // a picture that left the screen waits for one image at most.
+        let out = Taken::default();
+        let writer = Writer::start(out.clone(), Wakes::none());
+        let mut sink = writer.sink();
+        let open = three_chunks(61);
+        let first = open.ends[0];
+        let open_data = open.data.to_string();
+        sink.upload(open).expect("upload");
+        out.room.store(first, Ordering::Release);
+        taken_len(&out, first);
+        sink.upload(three_chunks(62)).expect("upload");
+        sink.delete(63, b"<delete>".to_vec()).expect("delete");
+        std::thread::sleep(Duration::from_millis(20));
+        out.room.store(usize::MAX, Ordering::Release);
+        wait_for(&out, |taken| taken.len() > open_data.len() + 8);
+        assert!(
+            written(&out).starts_with(&format!("{open_data}<delete>")),
+            "the delete waited behind an upload not yet begun"
+        );
+    }
+
+    #[test]
+    fn starved_on_screen() {
+        // Two waiting behind the frames, the older stopped as off screen part
+        // way: the other goes, and the stopped one never finishes.
+        let mut lanes = Lanes::default();
+        let (older, older_held) = big_upload(31, 5, 100);
+        let (newer, newer_held) = big_upload(32, 5, 100);
+        lanes.take(Job::Upload(older));
+        lanes.take(Job::Upload(newer));
+        starve(&mut lanes);
+        let mut turns = Turns::new();
+        turns.run(&mut lanes, || false, 4);
+        lanes.take(Job::Delete {
+            id: 31,
+            bytes: b"<delete>".to_vec(),
+        });
+        turns.run(&mut lanes, &newer_held, 40);
+        assert!(
+            !older_held(),
+            "an upload stopped as off screen was finished"
+        );
+        assert!(
+            newer_held(),
+            "the on-screen upload never finished behind the frames"
         );
     }
 
