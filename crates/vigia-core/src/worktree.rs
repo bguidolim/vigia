@@ -89,6 +89,10 @@ pub struct Worktree {
     lfs_wait: Cell<Option<std::time::SystemTime>>,
     /// Git's score for each pair of versions a walk weighed as a rename.
     pair_scores: RefCell<HashMap<rename::PairKey, DatedScore>>,
+    /// Whether each small worktree side under LFS is a pointer, by its stamp.
+    worktree_pointers: RefCell<HashMap<u64, bool>>,
+    /// The scores an LFS pair took without its object, by the object's path.
+    lfs_unfetched: RefCell<HashMap<rename::PairKey, PathBuf>>,
     /// Frames walked, which dates each score.
     pair_frame: Cell<u64>,
     /// Candidate bytes the current frame may still score.
@@ -148,6 +152,8 @@ impl Worktree {
             lfs_wait: Cell::new(None),
             lfs: Cell::new(lfs),
             pair_scores: RefCell::new(HashMap::new()),
+            lfs_unfetched: RefCell::new(HashMap::new()),
+            worktree_pointers: RefCell::new(HashMap::new()),
             pair_frame: Cell::new(0),
             pair_budget: Cell::new(rename::FRAME_BUDGET),
             unscored: RefCell::new(Vec::new()),
@@ -274,10 +280,7 @@ impl Worktree {
         };
         // The attribute is asked fresh, and before a compare, so a file it no
         // longer names spends nothing; the cache holds only what the bytes say.
-        if !self
-            .with_filter(|filter| filter.diff_attribute(&change.path))
-            .is_ok_and(|(_, lfs)| lfs)
-        {
+        if !self.lfs_cleaned(&change.path) {
             return false;
         }
         let key = (print, id);
@@ -324,6 +327,41 @@ impl Worktree {
         self.lfs_budget.update(|v| v - size);
         self.lfs_compares.update(|v| v + 1);
         same_bytes(path, &object, size)
+    }
+
+    /// Git's score for an LFS file in the worktree, of `raw` bytes, against the
+    /// removed blob `old`: that of the pointer git would store, which names
+    /// `old`'s object only when the bytes are that object.
+    fn lfs_score(&self, old: &[u8], to: &FileChange, raw: u64) -> LfsScore {
+        let spans = rename::Spans::of_side(old, false);
+        let score = |oid: &str| {
+            let pointer = picture::lfs_pointer_text(oid, raw);
+            spans.score(&rename::Spans::of_side(pointer.as_bytes(), false))
+        };
+        let missed = || LfsScore::Scored(score(NO_OID));
+        let Some((oid, size)) = picture::lfs_pointer(old).filter(|&(_, size)| size == raw) else {
+            return missed();
+        };
+        // Git would hash the bytes; vigia has no SHA-256.
+        let object = match self.lfs_path(oid) {
+            Ok(object) => object,
+            Err(missing) => return LfsScore::Unfetched(score(NO_OID), missing),
+        };
+        if size > self.lfs_budget.get() {
+            return LfsScore::Worker(score(NO_OID));
+        }
+        self.lfs_budget.update(|v| v - size);
+        self.lfs_compares.update(|v| v + 1);
+        match same_bytes(&self.workdir.join(&to.path), &object, size) {
+            Some(true) => LfsScore::Scored(score(oid)),
+            _ => missed(),
+        }
+    }
+
+    /// Whether git cleans `path` through LFS.
+    fn lfs_cleaned(&self, path: &str) -> bool {
+        self.with_filter(|filter| filter.diff_attribute(path))
+            .is_ok_and(|(_, lfs)| lfs)
     }
 
     /// The object and size the blob `id` names when it is an LFS pointer, read
@@ -555,6 +593,10 @@ impl Worktree {
             self.pair_budget.update(|v| v - cost);
             true
         };
+        // Each worktree side git cleans through LFS, by its raw size, as sizing
+        // found it: git scores the pointer it would store, not these bytes.
+        let lfs_sizes: RefCell<HashMap<usize, u64>> = RefCell::default();
+        let lfs_size = |at: usize| lfs_sizes.borrow().get(&at).copied();
         // Each side's size and stamp, from a header or a `stat`, before a byte.
         let sized = |at: usize| -> Option<(usize, u64, u64)> {
             let change = &changes[at];
@@ -586,8 +628,45 @@ impl Worktree {
                 }
                 Side::Worktree => {
                     let meta = std::fs::symlink_metadata(self.workdir.join(&change.path)).ok()?;
-                    meta.is_file()
-                        .then(|| (at, meta.len(), picture::path_stamp(&change.path, &meta)))
+                    if !meta.is_file() {
+                        return None;
+                    }
+                    let lfs = self.lfs_cleaned(&change.path);
+                    let stamp = picture::path_stamp(&change.path, &meta);
+                    // A pointer in the worktree is stored as it is. Read once
+                    // per version.
+                    let pointer = lfs && meta.len() < picture::POINTER_MAX as u64 && {
+                        let known = self.worktree_pointers.borrow().get(&stamp).copied();
+                        match known {
+                            Some(pointer) => pointer,
+                            None => {
+                                if !spend(rename::READ_COST) {
+                                    return None;
+                                }
+                                self.side_reads.update(|v| v + 1);
+                                // A read that failed is asked again next frame.
+                                let Ok(read) = std::fs::read(self.workdir.join(&change.path))
+                                else {
+                                    self.sides_left.set(true);
+                                    return None;
+                                };
+                                let pointer = picture::lfs_oid(&read).is_some();
+                                let mut seen = self.worktree_pointers.borrow_mut();
+                                if seen.len() >= PAIRS_KEPT {
+                                    seen.clear();
+                                }
+                                seen.insert(stamp, pointer);
+                                pointer
+                            }
+                        }
+                    };
+                    let size = if lfs && !pointer {
+                        lfs_sizes.borrow_mut().insert(at, meta.len());
+                        picture::lfs_pointer_text(NO_OID, meta.len()).len() as u64
+                    } else {
+                        meta.len()
+                    };
+                    Some((at, size, stamp))
                 }
             }
         };
@@ -683,6 +762,20 @@ impl Worktree {
         let mut score_all = |weighed: Vec<Weighed>| -> Vec<(u64, usize, usize)> {
             let mut scored = Vec::new();
             for pair in weighed {
+                let mut list = |differ: Option<u64>| {
+                    if self.unscored.borrow().len() >= rename::LISTED_MAX {
+                        self.pairs_unlisted.set(true);
+                    } else if listed.insert(pair.key) {
+                        let homes = homes.get_or_insert_with(|| {
+                            (self.repo().git_dir().to_owned(), self.lfs_store())
+                        });
+                        self.unscored.borrow_mut().push(rename::Candidate {
+                            key: pair.key,
+                            sides: self.pair_sources(&changes[pair.from], &changes[pair.to], homes),
+                            differ_score: differ,
+                        });
+                    }
+                };
                 let known = self
                     .pair_scores
                     .borrow_mut()
@@ -714,31 +807,37 @@ impl Worktree {
                     None if cost + rename::PAIR_COST <= self.pair_budget.get() => {
                         charge(pair.from, pair.sizes.0.max(rename::READ_COST));
                         charge(pair.to, pair.sizes.1.max(rename::READ_COST));
+                        let lfs = lfs_size(pair.to).map(|raw| {
+                            let old = bytes_of(pair.from).unwrap_or_default();
+                            self.lfs_score(&old, &changes[pair.to], raw)
+                        });
+                        if let Some(LfsScore::Worker(differ)) = lfs {
+                            list(Some(differ));
+                            continue;
+                        }
                         self.pair_budget.update(|v| v - rename::PAIR_COST);
                         self.pairs_scored.update(|v| v + 1);
-                        let score = match (spans_of(pair.from), spans_of(pair.to)) {
-                            (Some(old), Some(new)) => old.score(&new),
+                        let score = match (&lfs, spans_of(pair.from), spans_of(pair.to)) {
+                            (Some(LfsScore::Scored(score) | LfsScore::Unfetched(score, _)), ..) => {
+                                *score
+                            }
+                            (None, Some(old), Some(new)) => old.score(&new),
                             _ => 0,
                         };
                         self.keep_score(pair.key, score);
+                        // Dropped once the object lands, so the walk after compares.
+                        if let Some(LfsScore::Unfetched(_, missing)) = lfs {
+                            self.lfs_unfetched.borrow_mut().insert(pair.key, missing);
+                        }
                         score
                     }
+                    // An LFS pair costs little; the next frame scores it.
+                    None if lfs_size(pair.to).is_some() => {
+                        self.sides_left.set(true);
+                        continue;
+                    }
                     None => {
-                        if self.unscored.borrow().len() >= rename::LISTED_MAX {
-                            self.pairs_unlisted.set(true);
-                        } else if listed.insert(pair.key) {
-                            let homes = homes.get_or_insert_with(|| {
-                                (self.repo().git_dir().to_owned(), self.lfs_store())
-                            });
-                            self.unscored.borrow_mut().push(rename::Candidate {
-                                key: pair.key,
-                                sides: self.pair_sources(
-                                    &changes[pair.from],
-                                    &changes[pair.to],
-                                    homes,
-                                ),
-                            });
-                        }
+                        list(None);
                         continue;
                     }
                 };
@@ -891,6 +990,20 @@ impl Worktree {
                 self.pair_epoch.update(|v| v + 1);
             }
         }
+        // A score made without its object goes once the object lands, or once
+        // no walk asks for it. Each object is looked for once.
+        let mut landed: HashMap<PathBuf, bool> = HashMap::new();
+        self.lfs_unfetched.borrow_mut().retain(|key, missing| {
+            let asked = scores.get(key).is_some_and(|kept| kept.frame == last);
+            let landed = *landed
+                .entry(missing.clone())
+                .or_insert_with(|| missing.is_file());
+            if landed || !asked {
+                scores.remove(key);
+                return false;
+            }
+            true
+        });
         drop(scores);
         self.pair_budget.set(rename::FRAME_BUDGET);
         self.unscored.borrow_mut().clear();
@@ -2496,7 +2609,61 @@ pub fn indexed_extensions(root: &Path, per_extension: usize) -> Vec<Indexed> {
 
 #[cfg(test)]
 mod tests {
-    use super::git_separators;
+    use super::{COMPARE_CHUNK, git_separators, same_readers};
+
+    /// A reader of `len` zero bytes, with a byte flipped at `flip`, that
+    /// counts what it hands out and refuses a read past one chunk.
+    struct Counted {
+        len: u64,
+        flip: Option<u64>,
+        at: u64,
+        read: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    impl std::io::Read for Counted {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            assert!(out.len() <= COMPARE_CHUNK, "a read of {} bytes", out.len());
+            let n = out
+                .len()
+                .min(usize::try_from(self.len - self.at).unwrap_or(usize::MAX));
+            for (i, byte) in out[..n].iter_mut().enumerate() {
+                *byte = u8::from(self.flip == Some(self.at + i as u64));
+            }
+            self.at += n as u64;
+            self.read.set(self.read.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    /// Two sides of a 2 GiB compare that differ in the first chunk: no read is
+    /// larger than a chunk, and nothing past it is read.
+    #[test]
+    fn compare_bounded() {
+        let len = 2 * 1024 * 1024 * 1024;
+        let read = std::rc::Rc::new(std::cell::Cell::new(0));
+        let side = |flip| Counted {
+            len,
+            flip,
+            at: 0,
+            read: read.clone(),
+        };
+        assert_eq!(same_readers(side(None), side(Some(10)), len), Some(false));
+        assert_eq!(
+            read.get(),
+            2 * COMPARE_CHUNK as u64,
+            "read past the first difference"
+        );
+        read.set(0);
+        let small = 3 * COMPARE_CHUNK as u64 + 5;
+        let side = |flip| Counted {
+            len: small,
+            flip,
+            at: 0,
+            read: read.clone(),
+        };
+        assert_eq!(same_readers(side(None), side(None), small), Some(true));
+        assert_eq!(read.get(), 2 * small);
+    }
 
     /// The separator rule, on every platform rather than on one.
     #[test]
@@ -2667,6 +2834,22 @@ mod composing {
 /// stored blob.
 type LfsKey = (Fingerprint, gix::ObjectId);
 
+/// What [`Worktree::lfs_score`] found.
+enum LfsScore {
+    /// Decided in this walk.
+    Scored(u64),
+    /// Past the walk's compare budget, for the worker to compare: the score
+    /// when the bytes are not the object.
+    Worker(u64),
+    /// The object, at the path given, is not fetched, so the bytes could not
+    /// be compared.
+    Unfetched(u64, PathBuf),
+}
+
+/// An oid no LFS object has, being no hex, for a pointer whose object is not
+/// the one compared.
+const NO_OID: &str = "----------------------------------------------------------------";
+
 /// Bytes one status walk may compare between LFS files and their objects.
 const LFS_COMPARE_MAX: u64 = 16 * 1024 * 1024;
 
@@ -2717,8 +2900,7 @@ fn lfs_configured(repo: &gix::Repository) -> bool {
 /// Whether two regular files of `len` bytes each hold the same bytes, read side
 /// by side and stopped at the first chunk that differs, or `None` when a read
 /// failed and nothing is known.
-fn same_bytes(a: &Path, b: &Path, len: u64) -> Option<bool> {
-    use std::io::Read;
+pub(crate) fn same_bytes(a: &Path, b: &Path, len: u64) -> Option<bool> {
     // Checked by path first, so a fifo is never opened.
     let regular = |path: &Path| std::fs::metadata(path).is_ok_and(|meta| meta.is_file());
     if !regular(a) || !regular(b) {
@@ -2729,15 +2911,22 @@ fn same_bytes(a: &Path, b: &Path, len: u64) -> Option<bool> {
         let meta = file.metadata().ok()?;
         Some((meta.is_file() && meta.len() == len).then_some(file))
     };
-    let (Some(mut a), Some(mut b)) = (open(a)?, open(b)?) else {
+    let (Some(a), Some(b)) = (open(a)?, open(b)?) else {
         return Some(false);
     };
-    let (mut left, mut right) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    same_readers(a, b, len)
+}
+
+/// The most either side of a byte compare holds at once.
+const COMPARE_CHUNK: usize = 64 * 1024;
+
+/// Whether `a` and `b` hold the same `len` bytes, read a chunk at a time and
+/// no further than the first that differs.
+fn same_readers(mut a: impl std::io::Read, mut b: impl std::io::Read, len: u64) -> Option<bool> {
+    let (mut left, mut right) = (vec![0u8; COMPARE_CHUNK], vec![0u8; COMPARE_CHUNK]);
     let mut remaining = len;
     while remaining > 0 {
-        let chunk = left
-            .len()
-            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let chunk = COMPARE_CHUNK.min(usize::try_from(remaining).unwrap_or(usize::MAX));
         a.read_exact(&mut left[..chunk]).ok()?;
         b.read_exact(&mut right[..chunk]).ok()?;
         if left[..chunk] != right[..chunk] {

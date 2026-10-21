@@ -1341,3 +1341,259 @@ fn candidate_slot_name() {
     }
     assert_eq!(kind_of(frame.files(), "y.bin"), &renamed("z/y.bin"));
 }
+
+/// [`moved`] with `*.png` under git-lfs; `None` where it is not installed.
+fn lfs_moved(
+    name: &str,
+    files: &[(&str, Vec<u8>)],
+    written: &[(&str, Vec<u8>)],
+) -> Option<Scratch> {
+    let installed = std::process::Command::new("git")
+        .args(["lfs", "version"])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !installed {
+        assert!(std::env::var_os("CI").is_none(), "git-lfs is missing on CI");
+        eprintln!("skipped: git-lfs is not installed");
+        return None;
+    }
+    let scratch = Scratch::new(name);
+    scratch.git(&["lfs", "install", "--local"]);
+    scratch.write(
+        ".gitattributes",
+        "*.png filter=lfs diff=lfs merge=lfs -text\n",
+    );
+    for (path, bytes) in files {
+        scratch.write(path, bytes);
+    }
+    scratch.commit_all("initial");
+    for (path, _) in files {
+        std::fs::remove_file(scratch.path_of(path)).expect("remove");
+    }
+    for (path, bytes) in written {
+        scratch.write(path, bytes);
+    }
+    Some(scratch)
+}
+
+/// The kind of `path` after a few frames, unstaged, then staged, each
+/// checked against `git`'s entry for it.
+fn lfs_kinds(scratch: &Scratch, path: &str, git: (&str, &str)) -> (ChangeKind, ChangeKind) {
+    let entry = (git.0.to_owned(), git.1.to_owned());
+    assert!(
+        git_unstaged(scratch).contains(&entry),
+        "the fixture is wrong: {:?}",
+        git_unstaged(scratch)
+    );
+    let worktree = scratch.worktree();
+    let mut frame = worktree.frame();
+    for _ in 0..3 {
+        frame.advance().expect("advance");
+    }
+    let unstaged = kind_of(frame.files(), path).clone();
+    scratch.git(&["add", "-A"]);
+    assert!(
+        git_staged(scratch).contains(&entry),
+        "the fixture is wrong staged: {:?}",
+        git_staged(scratch)
+    );
+    (unstaged, kind_of(&staged(scratch), path).clone())
+}
+
+#[test]
+fn lfs_rename_unchanged() {
+    // Git scores the pointers it stores, so an LFS file moved unchanged is
+    // a rename in both runs.
+    let old = noise(130, 300_000);
+    let Some(scratch) = lfs_moved(
+        "rename-lfs-same",
+        &[("a.png", old.clone())],
+        &[("b.png", old)],
+    ) else {
+        return;
+    };
+    assert_eq!(
+        lfs_kinds(&scratch, "b.png", ("R a.png", "b.png")),
+        (renamed("a.png"), renamed("a.png"))
+    );
+}
+
+#[test]
+fn lfs_rename_edited() {
+    // Two pointers to different objects score under git's bar, so an LFS file
+    // moved and edited is no rename, under its own name or another.
+    let old = noise(131, 300_000);
+    for (case, from, to) in [
+        ("other", "a.png", "b.png"),
+        ("same", "d0/x.png", "d1/x.png"),
+    ] {
+        let Some(scratch) = lfs_moved(
+            &format!("rename-lfs-edit-{case}"),
+            &[(from, old.clone())],
+            &[(to, tail_changed(&old, 0.01))],
+        ) else {
+            return;
+        };
+        assert_eq!(
+            lfs_kinds(&scratch, to, ("A", to)),
+            (ChangeKind::Added, ChangeKind::Added),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn lfs_rename_past_budget() {
+    // An LFS file past what a walk may compare goes to the worker, which pairs
+    // it only when its bytes are the removed object, not when they are close.
+    let old = noise(132, 17 * 1024 * 1024);
+    for (case, new, git_pairs) in [
+        ("same", old.clone(), true),
+        ("edited", tail_changed(&old, 0.01), false),
+    ] {
+        let Some(scratch) = lfs_moved(
+            &format!("rename-lfs-large-{case}"),
+            &[("a.png", old.clone())],
+            &[("b.png", new)],
+        ) else {
+            return;
+        };
+        let git = git_unstaged(&scratch);
+        assert_eq!(
+            git.contains(&("R a.png".to_owned(), "b.png".to_owned())),
+            git_pairs,
+            "{case}: the fixture is wrong: {git:?}"
+        );
+        let worktree = scratch.worktree();
+        let mut frame = worktree.frame();
+        frame.advance().expect("advance");
+        let pending = frame.unscored_pairs();
+        assert_eq!(pending.len(), 1, "{case}: {pending:?}");
+        assert!(
+            pending[0].differ_score.is_some(),
+            "{case}: listed as an ordinary pair"
+        );
+        frame.learn_pair(pending[0].key, vigia_core::candidate_score(&pending[0]));
+        frame.advance().expect("advance");
+        let want = if git_pairs {
+            renamed("a.png")
+        } else {
+            ChangeKind::Added
+        };
+        assert_eq!(kind_of(frame.files(), "b.png"), &want, "{case}");
+    }
+}
+
+#[test]
+fn lfs_rename_grown() {
+    // A file of another size than the stored pointer records is never the
+    // object, so it costs no compare.
+    let old = noise(133, 300_000);
+    let mut grown = old.clone();
+    grown.extend(noise(134, 1_000));
+    let Some(scratch) = lfs_moved("rename-lfs-grown", &[("a.png", old)], &[("b.png", grown)])
+    else {
+        return;
+    };
+    let git = git_unstaged(&scratch);
+    assert!(
+        git.contains(&("A".to_owned(), "b.png".to_owned())),
+        "the fixture is wrong: {git:?}"
+    );
+    let worktree = scratch.worktree();
+    let mut frame = worktree.frame();
+    for _ in 0..3 {
+        frame.advance().expect("advance");
+    }
+    assert_eq!(kind_of(frame.files(), "b.png"), &ChangeKind::Added);
+    assert_eq!(
+        worktree.lfs_compares(),
+        0,
+        "a compare ran for a size the pointer rules out"
+    );
+}
+
+#[test]
+fn lfs_rename_unfetched() {
+    // An object not fetched cannot be compared, so the move shows as removed
+    // and added until it is fetched, and then the move pairs.
+    let old = noise(135, 300_000);
+    let Some(scratch) = lfs_moved(
+        "rename-lfs-unfetched",
+        &[("a.png", old.clone())],
+        &[("b.png", old)],
+    ) else {
+        return;
+    };
+    let objects = scratch.path_of(".git/lfs/objects");
+    let away = scratch.path_of(".git/lfs/away");
+    std::fs::rename(&objects, &away).expect("unfetch");
+    let worktree = scratch.worktree();
+    let mut frame = worktree.frame();
+    for _ in 0..3 {
+        frame.advance().expect("advance");
+    }
+    assert_eq!(kind_of(frame.files(), "b.png"), &ChangeKind::Added);
+    std::fs::rename(&away, &objects).expect("fetch");
+    frame.advance().expect("advance");
+    assert_eq!(kind_of(frame.files(), "b.png"), &renamed("a.png"));
+}
+
+#[test]
+fn lfs_rename_pointer_worktree() {
+    // A file that is its own pointer, as a clone that skipped the smudge
+    // leaves it, is stored as it is: moved and added with `-N`, gix leaves it
+    // unpaired, and git pairs it.
+    let old = noise(136, 300_000);
+    let Some(scratch) = lfs_moved("rename-lfs-pointer", &[("a.png", old)], &[]) else {
+        return;
+    };
+    let pointer = scratch.git(&["show", "HEAD:a.png"]);
+    assert!(pointer.starts_with("version https://git-lfs"), "{pointer}");
+    scratch.write("b.png", pointer);
+    scratch.git(&["add", "-N", "b.png"]);
+    let git = scratch.git(&["diff", "-M", "--name-status"]);
+    assert!(
+        git.starts_with("R100\ta.png\tb.png"),
+        "the fixture is wrong: {git}"
+    );
+    let worktree = scratch.worktree();
+    let mut frame = worktree.frame();
+    for _ in 0..3 {
+        frame.advance().expect("advance");
+    }
+    assert_eq!(kind_of(frame.files(), "b.png"), &renamed("a.png"));
+}
+
+#[test]
+fn lfs_unfetched_quiet() {
+    // Moves whose objects are not fetched are scored once and kept, so the
+    // frames go quiet rather than score them again on every walk.
+    let files: Vec<(String, Vec<u8>)> = (0..20)
+        .map(|n| (format!("old/{n:02}.png"), noise(140 + n, 1_000)))
+        .collect();
+    let written: Vec<(String, Vec<u8>)> = files
+        .iter()
+        .map(|(path, bytes)| (path.replace("old/", "new/"), bytes.clone()))
+        .collect();
+    let Some(scratch) = lfs_moved("rename-lfs-unfetched-many", &refs(&files), &refs(&written))
+    else {
+        return;
+    };
+    std::fs::rename(
+        scratch.path_of(".git/lfs/objects"),
+        scratch.path_of(".git/lfs/away"),
+    )
+    .expect("unfetch");
+    // Past the settle margin, so a wake is the rename pass's alone.
+    let scratch = scratch.settled();
+    let worktree = scratch.worktree();
+    let mut frame = worktree.frame();
+    for walks in 1.. {
+        frame.advance().expect("advance");
+        if frame.settles_in(std::time::SystemTime::now()).is_none() {
+            break;
+        }
+        assert!(walks < 10, "still waking after {walks} walks");
+    }
+}
