@@ -93,6 +93,10 @@ pub struct Worktree {
     worktree_pointers: RefCell<HashMap<u64, bool>>,
     /// The scores an LFS pair took without its object, by the object's path.
     lfs_unfetched: RefCell<HashMap<rename::PairKey, PathBuf>>,
+    /// [`PAIRS_KEPT`], lower in a test that fills the record.
+    pairs_kept: Cell<usize>,
+    /// The scores a full record may drop this frame, found when first needed.
+    stale_keys: RefCell<Option<Vec<rename::PairKey>>>,
     /// Frames walked, which dates each score.
     pair_frame: Cell<u64>,
     /// Candidate bytes the current frame may still score.
@@ -154,6 +158,8 @@ impl Worktree {
             pair_scores: RefCell::new(HashMap::new()),
             lfs_unfetched: RefCell::new(HashMap::new()),
             worktree_pointers: RefCell::new(HashMap::new()),
+            pairs_kept: Cell::new(PAIRS_KEPT),
+            stale_keys: RefCell::new(None),
             pair_frame: Cell::new(0),
             pair_budget: Cell::new(rename::FRAME_BUDGET),
             unscored: RefCell::new(Vec::new()),
@@ -617,7 +623,7 @@ impl Worktree {
                             self.side_reads.update(|v| v + 1);
                             let size = self.repo().find_header(id).ok()?.size();
                             let mut sizes = self.blob_sizes.borrow_mut();
-                            if sizes.len() >= PAIRS_KEPT {
+                            if sizes.len() >= SIDES_KEPT {
                                 sizes.clear();
                             }
                             sizes.insert(id, size);
@@ -652,7 +658,7 @@ impl Worktree {
                                 };
                                 let pointer = picture::lfs_oid(&read).is_some();
                                 let mut seen = self.worktree_pointers.borrow_mut();
-                                if seen.len() >= PAIRS_KEPT {
+                                if seen.len() >= SIDES_KEPT {
                                     seen.clear();
                                 }
                                 seen.insert(stamp, pointer);
@@ -798,7 +804,7 @@ impl Worktree {
                     // Past what the scores hold with those listed, a new score
                     // would evict another.
                     None if self.pair_scores.borrow().len() + self.unscored.borrow().len()
-                        >= PAIRS_KEPT =>
+                        >= self.pairs_kept.get() =>
                     {
                         self.room_wanted.set(true);
                         self.pairs_unlisted.set(true);
@@ -982,8 +988,9 @@ impl Worktree {
         // new pair.
         let last = self.pair_frame.get();
         self.pair_frame.set(last + 1);
+        self.stale_keys.borrow_mut().take();
         let mut scores = self.pair_scores.borrow_mut();
-        if scores.len() >= PAIRS_KEPT {
+        if scores.len() >= self.pairs_kept.get() {
             let before = scores.len();
             scores.retain(|_, kept| kept.frame == last);
             if scores.len() < before {
@@ -1024,7 +1031,7 @@ impl Worktree {
         let frame = self.pair_frame.get();
         let scores = self.pair_scores.borrow();
         self.room_wanted.get()
-            && scores.len() >= PAIRS_KEPT
+            && scores.len() >= self.pairs_kept.get()
             && scores.values().any(|dated| dated.frame < frame)
     }
 
@@ -1043,18 +1050,26 @@ impl Worktree {
         self.keep_score(key, score);
     }
 
-    /// Keep a pair's score, bounded by [`PAIRS_KEPT`]: a full record makes
+    /// Keep a pair's score, bounded by the record's size: a full record makes
     /// room by dropping a score this frame has not asked for, and drops the new
     /// one when there is none.
     fn keep_score(&self, key: rename::PairKey, score: u64) {
         let mut scores = self.pair_scores.borrow_mut();
         let frame = self.pair_frame.get();
-        if scores.len() >= PAIRS_KEPT && !scores.contains_key(&key) {
-            let Some(stale) = scores
-                .iter()
-                .find(|(_, dated)| dated.frame < frame)
-                .map(|(&stale, _)| stale)
-            else {
+        if scores.len() >= self.pairs_kept.get() && !scores.contains_key(&key) {
+            // Found once a frame, since a score only goes stale at a renew.
+            let mut stale_keys = self.stale_keys.borrow_mut();
+            let stale_keys = stale_keys.get_or_insert_with(|| {
+                scores
+                    .iter()
+                    .filter(|(_, dated)| dated.frame < frame)
+                    .map(|(&stale, _)| stale)
+                    .collect()
+            });
+            let still = |stale: &rename::PairKey| {
+                scores.get(stale).is_some_and(|dated| dated.frame < frame)
+            };
+            let Some(stale) = std::iter::from_fn(|| stale_keys.pop()).find(still) else {
                 return;
             };
             scores.remove(&stale);
@@ -1062,6 +1077,18 @@ impl Worktree {
             self.pair_epoch.update(|v| v + 1);
         }
         scores.insert(key, DatedScore { score, frame });
+    }
+
+    /// Hold at most `kept` rename scores, so a test can fill the record with
+    /// a fixture of a few dozen files. A test seam.
+    #[doc(hidden)]
+    pub fn keep_pairs(&self, kept: usize) {
+        self.pairs_kept.set(kept);
+    }
+
+    /// The most scores the record holds.
+    pub(crate) fn pairs_kept(&self) -> usize {
+        self.pairs_kept.get()
     }
 
     /// How many times the record dropped scores.
@@ -2709,6 +2736,55 @@ mod tests {
 }
 
 #[cfg(test)]
+mod record {
+    use super::{DatedScore, Worktree};
+
+    /// A full record's stale list, found at the first answer past it, skips a
+    /// score a walk asked for since: that score stays, and the answer goes.
+    #[test]
+    fn stale_list_rechecked() {
+        let dir = std::env::temp_dir().join(format!(
+            "vigia-stale-list-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["init", "-q"])
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git init");
+        let worktree = Worktree::discover(&dir).expect("discover");
+        worktree.keep_pairs(4);
+        {
+            let mut scores = worktree.pair_scores.borrow_mut();
+            for n in 0..4u64 {
+                scores.insert((n, n), DatedScore { score: 0, frame: 0 });
+            }
+        }
+        worktree.pair_frame.set(1);
+        worktree.keep_score((10, 10), 0);
+        assert_eq!(worktree.pair_epoch(), 1, "the first answer made no room");
+        // Every score left is asked for again, as a walk between answers asks.
+        for dated in worktree.pair_scores.borrow_mut().values_mut() {
+            dated.frame = 1;
+        }
+        worktree.keep_score((11, 11), 0);
+        assert_eq!(
+            worktree.pair_epoch(),
+            1,
+            "an answer evicted a score a walk had just asked for"
+        );
+        assert!(!worktree.pair_scores.borrow().contains_key(&(11, 11)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod reading {
     /// Nothing `only` reaches past the position's own object reads as a working
     /// tree failing.
@@ -2853,21 +2929,25 @@ const NO_OID: &str = "----------------------------------------------------------
 /// Bytes one status walk may compare between LFS files and their objects.
 const LFS_COMPARE_MAX: u64 = 16 * 1024 * 1024;
 
-/// The most rename scores kept.
-const PAIRS_KEPT: usize = 4096;
+/// The most rename scores kept: git's whole matrix to about 360 by 360. Past
+/// it a pair shows as removed and added.
+const PAIRS_KEPT: usize = 131_072;
+
+/// The most blob sizes kept, one per side rather than per pair.
+const SIDES_KEPT: usize = 4096;
 
 /// The most walks a frame of `files` changes takes to size every side, and
 /// to list every pair for the worker, before it goes quiet, when no score
 /// pairs anything, since a pairing score walks again. A test seam.
 #[doc(hidden)]
-pub fn listing_walks(files: usize) -> (u64, u64) {
+pub fn listing_walks(files: usize, kept: usize) -> (u64, u64) {
     // A side costs at most a header, and a walk stops short only once a
     // header no longer fits. The last finds none left.
     let sides =
         (files as u64 * rename::READ_COST).div_ceil(rename::FRAME_BUDGET - rename::READ_COST) + 1;
     // A pair walk follows a listed batch landing, and listing stops once the
     // scores are full. The last finds the record full.
-    let pairs = PAIRS_KEPT.div_ceil(rename::LISTED_MAX) as u64 + 1;
+    let pairs = kept.div_ceil(rename::LISTED_MAX) as u64 + 1;
     (sides, pairs)
 }
 

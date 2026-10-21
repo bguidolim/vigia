@@ -1478,6 +1478,78 @@ fn rename_frame_many_small() {
     );
 }
 
+/// A hundred-file refactor, the old files removed only when `moved`.
+fn refactor_repo(name: &str, moved: bool) -> Scratch {
+    let (files, written) = support::refactor_files(100);
+    let scratch = Scratch::new(name);
+    for (path, bytes) in &files {
+        scratch.write(path, bytes);
+    }
+    scratch.commit_all("initial");
+    for (path, _) in &files {
+        if moved {
+            std::fs::remove_file(scratch.path_of(path)).expect("remove");
+        }
+    }
+    for (path, bytes) in &written {
+        scratch.write(path, bytes);
+    }
+    scratch
+}
+
+/// I9 over each frame of a hundred-file move until every pair is scored, by
+/// its slowest frame, against the same files where nothing moved.
+#[test]
+fn rename_frame_refactor() {
+    let moved = refactor_repo("budget-rename-refactor", true);
+    let plain = refactor_repo("budget-rename-refactor-plain", false);
+    let cold = |scratch: &Scratch| {
+        let worktree = Worktree::discover(scratch.path_of(".")).expect("discover");
+        let mut frame = worktree.frame();
+        let mut slowest = (Duration::ZERO, Duration::ZERO);
+        for frames in 1.. {
+            let took = time_cpu(|| frame.advance().expect("advance"));
+            if took.0 > slowest.0 {
+                slowest = took;
+            }
+            let listed = frame.unscored_pairs();
+            if listed.is_empty() && frame.settles_in(std::time::SystemTime::now()).is_none() {
+                break;
+            }
+            for candidate in listed {
+                frame.learn_pair(candidate.key, vigia_core::candidate_score(&candidate));
+            }
+            assert!(frames < 80, "the move still wakes after {frames} frames");
+        }
+        slowest
+    };
+    cold(&moved);
+    cold(&plain);
+    if !absolute_gates_apply("cargo test --release -p vigia-core --test budgets") {
+        return;
+    }
+    let (mut with, mut without) = (Samples::new(LFS_FRAMES), Samples::new(LFS_FRAMES));
+    for _ in 0..LFS_FRAMES {
+        with.push(cold(&moved).0);
+        without.push(cold(&plain).0);
+    }
+    let at = |samples: &Samples, q| samples.percentile(q).expect("samples");
+    eprintln!(
+        "rename refactor: slowest frame p50 {:?} p99 {:?}, without p50 {:?} p99 {:?}",
+        at(&with, 0.5),
+        at(&with, 0.99),
+        at(&without, 0.5),
+        at(&without, 0.99)
+    );
+    holds_p99(
+        "I9: each frame of a hundred similar files moved",
+        budget(I9_FRAME),
+        &with,
+        String::new,
+        || cold(&moved),
+    );
+}
+
 /// Code lines in the fenced block.
 const FENCE_LINES: usize = 24;
 /// Frames sampled for the fence gate.

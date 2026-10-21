@@ -4,7 +4,7 @@ mod support;
 
 use std::time::{Duration, SystemTime};
 
-use support::{Scratch, changes_sorted, noise, tail_changed};
+use support::{Scratch, changes_sorted, noise, refactor_files, tail_changed};
 use vigia_core::{ChangeKind, ChangeOptions, FileChange, Frame, Origin, pair_score};
 
 /// `list` with each path borrowed.
@@ -524,6 +524,7 @@ fn full_record_makes_room() {
         &[("b.bin", tail_changed(&old, 0.1))],
     );
     let worktree = scratch.worktree();
+    worktree.keep_pairs(4096);
     let mut frame = worktree.frame();
     frame.advance().expect("advance");
     // Past the frame's budget, the pair waits for the worker.
@@ -1063,6 +1064,7 @@ fn record_keeps_current_pairs() {
         &[("b.bin", tail_changed(&old, 0.1))],
     );
     let worktree = scratch.worktree();
+    worktree.keep_pairs(4096);
     let mut frame = worktree.frame();
     for n in 0..4096u64 {
         frame.learn_pair((u64::MAX - n, n), 0);
@@ -1114,6 +1116,7 @@ fn record_over_cap() {
             &refs(&news),
         );
         let worktree = scratch.worktree();
+        worktree.keep_pairs(4096);
         let mut frame = worktree.frame();
         let (mut quiet, mut asked, mut learned) = (0, Vec::new(), 0);
         for _ in 0..200 {
@@ -1180,6 +1183,7 @@ fn listed_room_no_wake() {
         .collect();
     let scratch = moved("rename-listed-room", &refs(&olds), &refs(&news));
     let worktree = scratch.worktree();
+    worktree.keep_pairs(4096);
     let mut frame = worktree.frame();
     for n in 0..3900u64 {
         frame.learn_pair((u64::MAX - n, n), 0);
@@ -1596,4 +1600,41 @@ fn lfs_unfetched_quiet() {
         }
         assert!(walks < 10, "still waking after {walks} walks");
     }
+}
+
+/// [`refactor_files`]'s move, unstaged.
+fn refactor(name: &str, n: usize) -> Scratch {
+    let (files, written) = refactor_files(n);
+    moved(name, &refs(&files), &refs(&written))
+}
+
+#[test]
+fn refactor_renames() {
+    // A hundred similar files moved is ten thousand pairs to score, and every
+    // move shows as a rename, as git shows it.
+    let scratch = refactor("rename-refactor", 100);
+    let git = git_unstaged(&scratch);
+    let renames = git
+        .iter()
+        .filter(|(status, _)| status.starts_with('R'))
+        .count();
+    assert_eq!(renames, 100, "the fixture is wrong: {git:?}");
+    let worktree = scratch.worktree();
+    let mut frame = worktree.frame();
+    for _ in 0..80 {
+        frame.advance().expect("advance");
+        let listed = frame.unscored_pairs();
+        if listed.is_empty() && frame.settles_in(std::time::SystemTime::now()).is_none() {
+            break;
+        }
+        for candidate in listed {
+            frame.learn_pair(candidate.key, vigia_core::candidate_score(&candidate));
+        }
+    }
+    let shown = frame
+        .files()
+        .iter()
+        .filter(|change| matches!(change.kind, ChangeKind::Renamed { .. }))
+        .count();
+    assert_eq!(shown, 100, "{shown} of 100 moves showed as renames");
 }
